@@ -37,14 +37,31 @@ def mask_border(m: Tensor, b: int, v: Union[Tensor, float, bool]) -> None:
     if b <= 0:
         return
 
-    m[:, :b] = v
-    m[:, :, :b] = v
-    m[:, :, :, :b] = v
-    m[:, :, :, :, :b] = v
-    m[:, -b:] = v
-    m[:, :, -b:] = v
-    m[:, :, :, -b:] = v
-    m[:, :, :, :, -b:] = v
+    # Store original shape
+    N, H0, W0, H1, W1 = m.shape
+
+    # Prepare a mask once for all border regions
+    mask = m.new_zeros(m.shape, dtype=torch.bool)
+
+    if b * 2 >= H0 or b * 2 >= W0 or b * 2 >= H1 or b * 2 >= W1:
+        # If border consumes the full tensor, just set all = v
+        m[:] = v
+        return
+
+    # H0 borders
+    mask[:, :b, :, :, :] = 1
+    mask[:, -b:, :, :, :] = 1
+    # W0 borders
+    mask[:, :, :b, :, :] = 1
+    mask[:, :, -b:, :, :] = 1
+    # H1 borders
+    mask[:, :, :, :b, :] = 1
+    mask[:, :, :, -b:, :] = 1
+    # W1 borders
+    mask[:, :, :, :, :b] = 1
+    mask[:, :, :, :, -b:] = 1
+
+    m[mask] = v
 
 
 def mask_border_with_padding(m: Tensor, bd: int, v: Union[Tensor, float, bool], p_m0: Tensor, p_m1: Tensor) -> None:
