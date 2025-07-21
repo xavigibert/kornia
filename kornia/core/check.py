@@ -293,11 +293,14 @@ def KORNIA_CHECK_SAME_SHAPE(x: Tensor, y: Tensor, raises: bool = True) -> bool:
         True
 
     """
-    if x.shape != y.shape:
-        if raises:
-            raise TypeError(f"Not same shape for tensors. Got: {x.shape} and {y.shape}")
-        return False
-    return True
+    x_shape = x.shape
+    y_shape = y.shape
+    if x_shape == y_shape:
+        return True
+    if raises:
+        # Avoid f-string for performance, use concatenation (faster path)
+        raise TypeError("Not same shape for tensors. Got: " + str(x_shape) + " and " + str(y_shape))
+    return False
 
 
 def KORNIA_CHECK_IS_COLOR(x: Tensor, msg: Optional[str] = None, raises: bool = True) -> bool:
