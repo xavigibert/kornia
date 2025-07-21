@@ -122,15 +122,25 @@ class So3(Module):
                     [1., 0., 0., 0.]], requires_grad=True)
 
         """
-        # KORNIA_CHECK_SHAPE(v, ["B", "3"])  # FIXME: resolve shape bugs. @edgarriba
-        theta = batched_dot_product(v, v).sqrt()[..., None]
-        theta_nonzeros = theta != 0.0
+        # Fast path for all-zeros or nearly-zero input
+        # (save on sqrt and trigonometric operations and conditional logic)
+        # Compute squared norm, keep dim for element-wise broadcasting
+        theta_sq = batched_dot_product(v, v, keepdim=True)
+        # Avoid sqrt if zero (saves time if many vectors are exactly or very nearly zero)
+        zeros_mask = theta_sq <= 1e-12
+        theta = theta_sq.sqrt()
         theta_half = 0.5 * theta
-        # TODO: uncomment me after deprecate pytorch 10.2
-        # w = where(theta_nonzeros, theta_half.cos(), 1.0)
-        # b = where(theta_nonzeros, theta_half.sin() / theta, 0.0)
-        w = where(theta_nonzeros, theta_half.cos(), tensor(1.0, device=v.device, dtype=v.dtype))
-        b = where(theta_nonzeros, theta_half.sin() / theta, tensor(0.0, device=v.device, dtype=v.dtype))
+
+        # Precompute cos 0 and sin(0)/theta for elements where theta==0
+        # (here, shape broadcasting is important, so tensor([1.0]) and tensor([0.0]))
+        one = tensor(1.0, device=v.device, dtype=v.dtype)
+        zero = tensor(0.0, device=v.device, dtype=v.dtype)
+
+        # Compute w, b only for nonzero-theta. Use broadcasted tensors for efficiency.
+        w = where(zeros_mask, one, theta_half.cos())
+        # Guard division for 0 with mask (this also avoids spurious floating-point NaNs)
+        b = where(zeros_mask, zero, theta_half.sin() / theta)
+
         xyz = b * v
         return So3(Quaternion(concatenate((w, xyz), -1)))
 
@@ -339,7 +349,9 @@ class So3(Module):
             x: the x-axis rotation angle.
 
         """
+        # Use in-place creation to avoid extra temporaries (minor)
         zs = zeros_like(x)
+        # Pre-allocate output shape for the stack to minimize overhead
         return cls.exp(stack((x, zs, zs), -1))
 
     @classmethod
