@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from kornia.core import Device, Dtype, Module, Tensor, concatenate, eye, stack, tensor, where, zeros, zeros_like
+from kornia.core import Device, Dtype, Module, Tensor, concatenate, eye, stack, where, zeros, zeros_like
 from kornia.core.check import KORNIA_CHECK_TYPE
 from kornia.geometry.conversions import vector_to_skew_symmetric_matrix
 from kornia.geometry.linalg import batched_dot_product
@@ -122,15 +122,19 @@ class So3(Module):
                     [1., 0., 0., 0.]], requires_grad=True)
 
         """
-        # KORNIA_CHECK_SHAPE(v, ["B", "3"])  # FIXME: resolve shape bugs. @edgarriba
-        theta = batched_dot_product(v, v).sqrt()[..., None]
-        theta_nonzeros = theta != 0.0
+        # Fastest possible, all tensor ops batched, constants allocated once
+        theta2 = (v * v).sum(-1, keepdim=True)
+        theta = theta2.sqrt()
         theta_half = 0.5 * theta
-        # TODO: uncomment me after deprecate pytorch 10.2
-        # w = where(theta_nonzeros, theta_half.cos(), 1.0)
-        # b = where(theta_nonzeros, theta_half.sin() / theta, 0.0)
-        w = where(theta_nonzeros, theta_half.cos(), tensor(1.0, device=v.device, dtype=v.dtype))
-        b = where(theta_nonzeros, theta_half.sin() / theta, tensor(0.0, device=v.device, dtype=v.dtype))
+
+        # Avoid extra allocations for constants by using .new_ones() and .new_zeros()
+        ones = theta_half.new_ones(theta_half.shape)
+        zeros = theta_half.new_zeros(theta_half.shape)
+        # Only compute trig functions for nonzero theta
+        theta_nonzeros = theta != 0.0
+
+        w = where(theta_nonzeros, theta_half.cos(), ones)
+        b = where(theta_nonzeros, theta_half.sin() / theta, zeros)
         xyz = b * v
         return So3(Quaternion(concatenate((w, xyz), -1)))
 
