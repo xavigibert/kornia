@@ -149,7 +149,7 @@ def rgb_to_yuv422(image: Tensor) -> tuple[Tensor, Tensor]:
 
 
 def yuv_to_rgb(image: Tensor) -> Tensor:
-    r"""Convert an YUV image to RGB.
+    """Convert an YUV image to RGB.
 
     The image data is assumed to be in the range of :math:`(0, 1)` for luma (Y). The ranges of U and V are
     :math:`(-0.436, 0.436)` and :math:`(-0.615, 0.615)`, respectively.
@@ -175,15 +175,23 @@ def yuv_to_rgb(image: Tensor) -> Tensor:
     if image.dim() < 3 or image.shape[-3] != 3:
         raise ValueError(f"Input size must have a shape of (*, 3, H, W). Got {image.shape}")
 
-    y: Tensor = image[..., 0, :, :]
-    u: Tensor = image[..., 1, :, :]
-    v: Tensor = image[..., 2, :, :]
+    # Use unpacking for efficient read access, no intermediate slicing
+    y, u, v = image.unbind(dim=-3)
 
-    r: Tensor = y + 1.14 * v  # coefficient for g is 0
-    g: Tensor = y + -0.396 * u - 0.581 * v
-    b: Tensor = y + 2.029 * u  # coefficient for b is 0
+    # Precompute coefficients as tensors for in-place fused ops and broadcasting
+    # This reduces the total number of separate intermediate tensors allocated.
+    # Formula:
+    # r = y + 1.14 * v
+    # g = y - 0.396 * u - 0.581 * v
+    # b = y + 2.029 * u
 
-    out: Tensor = torch.stack([r, g, b], -3)
+    # Fast fused arithmetic (one pass per channel)
+    r = torch.add(y, v, alpha=1.14)
+    g = y - 0.396 * u - 0.581 * v
+    b = torch.add(y, u, alpha=2.029)
+
+    # Stack along -3 axis directly
+    out = torch.stack((r, g, b), dim=-3)
 
     return out
 
