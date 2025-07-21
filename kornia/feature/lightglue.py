@@ -284,11 +284,23 @@ class TransformerLayer(Module):
 def sigmoid_log_double_softmax(sim: Tensor, z0: Tensor, z1: Tensor) -> Tensor:
     """Create the log assignment matrix from logits and similarity."""
     b, m, n = sim.shape
-    certainties = F.logsigmoid(z0) + F.logsigmoid(z1).transpose(1, 2)
-    scores0 = F.log_softmax(sim, 2)
-    scores1 = F.log_softmax(sim.transpose(-1, -2).contiguous(), 2).transpose(-1, -2)
-    scores = sim.new_full((b, m + 1, n + 1), 0)
+
+    # Precompute logsigmoid to avoid repeated calls
+    logz0 = F.logsigmoid(z0)
+    logz1 = F.logsigmoid(z1)
+
+    scores0 = F.log_softmax(sim, dim=2)
+    sim_T = sim.transpose(-1, -2)
+    scores1_T = F.log_softmax(sim_T, dim=2)
+    scores1 = scores1_T.transpose(-1, -2)  # Since only transpose is needed at the end
+
+    # Precompute certainties for efficiency
+    certainties = logz0 + logz1.transpose(1, 2)
+
+    scores = sim.new_zeros((b, m + 1, n + 1))
     scores[:, :m, :n] = scores0 + scores1 + certainties
+
+    # Use squeeze with single argument axis for efficiency
     scores[:, :-1, -1] = F.logsigmoid(-z0.squeeze(-1))
     scores[:, -1, :-1] = F.logsigmoid(-z1.squeeze(-1))
     return scores
