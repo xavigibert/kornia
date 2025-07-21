@@ -69,7 +69,6 @@ class So2(Module):
         """
         super().__init__()
         KORNIA_CHECK_IS_TENSOR(z)
-        # TODO change to KORNIA_CHECK_SHAPE once there is multiple shape support
         check_so2_z_shape(z)
         self._z = Parameter(z)
 
@@ -164,12 +163,20 @@ class So2(Module):
                     [1.5707, 0.0000]])
 
         """
-        # TODO change to KORNIA_CHECK_SHAPE once there is multiple shape support
-        check_so2_theta_shape(theta)
+        # inlined check for efficiency
+        theta_shape = theta.shape
+        len_theta_shape = len(theta_shape)
+        if (
+            (len_theta_shape == 2 and theta_shape[1] != 1)
+            or (len_theta_shape == 0 and not theta.numel())
+            or (len_theta_shape > 2)
+        ):
+            raise ValueError(f"Invalid input size, we expect [B]. Got: {theta_shape}")
+
+        # Efficient tensor creation with minimized temporaries
         z = zeros_like(theta)
-        row0 = stack((z, theta), -1)
-        row1 = stack((theta, z), -1)
-        return stack((row0, row1), -1)
+        res = stack([stack([z, theta], -1), stack([theta, z], -1)], -2)
+        return res
 
     @staticmethod
     def vee(omega: Tensor) -> Tensor:
