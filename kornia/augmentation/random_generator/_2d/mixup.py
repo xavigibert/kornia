@@ -21,8 +21,8 @@ import torch
 from torch.distributions import Bernoulli
 
 from kornia.augmentation.random_generator.base import RandomGeneratorBase, UniformDistribution
-from kornia.augmentation.utils import _adapted_rsampling, _adapted_sampling, _common_param_check, _joint_range_check
-from kornia.utils.helpers import _extract_device_dtype
+from kornia.augmentation.utils import _joint_range_check
+from kornia.core import Tensor
 
 __all__ = ["MixupGenerator"]
 
@@ -66,18 +66,53 @@ class MixupGenerator(RandomGeneratorBase):
         self.prob_sampler = Bernoulli(torch.tensor(float(self.p), device=device, dtype=dtype))
 
     def forward(self, batch_shape: Tuple[int, ...], same_on_batch: bool = False) -> Dict[str, torch.Tensor]:
+        # Inline all external util calls for lower call overhead and faster dispatch.
         batch_size = batch_shape[0]
 
-        _common_param_check(batch_size, same_on_batch)
-        _device, _dtype = _extract_device_dtype([self.lambda_val])
+        # Fast param check - inlined version to avoid extra stack/call/lookup
+        if not (isinstance(batch_size, int) and batch_size >= 0):
+            raise AssertionError(f"`batch_size` shall be a positive integer. Got {batch_size}.")
+        if same_on_batch is not None and not isinstance(same_on_batch, bool):
+            raise AssertionError(f"`same_on_batch` shall be boolean. Got {same_on_batch}.")
 
+        # Fast device, dtype extract
+        lambda_val = self.lambda_val
+        device, dtype = None, None
+        if lambda_val is not None and isinstance(lambda_val, Tensor):
+            device = lambda_val.device
+            dtype = lambda_val.dtype
+
+        if device is None:
+            device = torch.device("cpu")
+        if dtype is None:
+            dtype = torch.get_default_dtype()
+
+        # Sample batch_probs efficiently without function indirection
         with torch.no_grad():
-            batch_probs: torch.Tensor = _adapted_sampling((batch_size,), self.prob_sampler, same_on_batch)
-        mixup_pairs: torch.Tensor = torch.randperm(batch_size, device=_device, dtype=_dtype).long()
-        mixup_lambdas: torch.Tensor = _adapted_rsampling((batch_size,), self.lambda_sampler, same_on_batch)
+            # _adapted_sampling inlined here for speed
+            dist = self.prob_sampler
+            shape = (batch_size,)
+            if same_on_batch:
+                batch_probs = dist.sample(torch.Size((1,))).repeat(batch_size)
+            else:
+                batch_probs = dist.sample(torch.Size(shape))
+
+        # Use torch.randperm directly for better speed and less object conversion
+        # Use previously determined device and dtype
+        mixup_pairs = torch.randperm(batch_size, device=device).long()
+
+        # Sample lambdas efficiently (using inlined _adapted_rsampling for speed) and avoid copying when possible
+        dist = self.lambda_sampler
+        if same_on_batch:
+            rsample = dist.rsample(torch.Size((1,)))
+            mixup_lambdas = rsample.repeat(batch_size)
+        else:
+            mixup_lambdas = dist.rsample(torch.Size((batch_size,)))
         mixup_lambdas = mixup_lambdas * batch_probs
 
+        # Construct dict while minimizing tensor copying/casting
+        # .to for dtype-safe output
         return {
-            "mixup_pairs": mixup_pairs.to(device=_device, dtype=torch.long),
-            "mixup_lambdas": mixup_lambdas.to(device=_device, dtype=_dtype),
+            "mixup_pairs": mixup_pairs.to(device=device, dtype=torch.long),
+            "mixup_lambdas": mixup_lambdas.to(device=device, dtype=dtype),
         }
