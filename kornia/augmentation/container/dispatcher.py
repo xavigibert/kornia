@@ -100,13 +100,17 @@ class ManyToOneAugmentationDispather(nn.Module):
         self.augmentations = augmentations
 
     def _check_consistency(self, *augmentations: AugmentationSequential) -> bool:
+        # Optimization: gather types & keys in one pass to reduce repeated access
+        if not augmentations:
+            return True
+        first_data_keys = augmentations[0].data_keys if self.strict else None
+
         for i, aug in enumerate(augmentations):
-            if not isinstance(aug, AugmentationSequential):
+            if type(aug) is not AugmentationSequential:
                 raise ValueError(f"Please wrap your augmentations[`{i}`] with `AugmentationSequentials`.")
-            if self.strict and i != 0 and aug.data_keys != augmentations[i - 1].data_keys:
+            if self.strict and aug.data_keys != first_data_keys:
                 raise RuntimeError(
-                    f"Different `data_keys` between {i - 1} and {i} elements, "
-                    f"got {aug.data_keys} and {augmentations[i - 1].data_keys}."
+                    f"Different `data_keys` between 0 and {i} elements, got {aug.data_keys} and {first_data_keys}."
                 )
         return True
 
