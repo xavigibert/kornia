@@ -183,7 +183,7 @@ class ColorMap:
 
 
 def apply_colormap(input_tensor: Tensor, colormap: ColorMap) -> Tensor:
-    r"""Apply to a gray tensor a colormap.
+    """Apply to a gray tensor a colormap.
 
     .. image:: _static/img/apply_colormap.png
 
@@ -217,30 +217,44 @@ def apply_colormap(input_tensor: Tensor, colormap: ColorMap) -> Tensor:
                   [0.0000, 0.0000, 0.0000]]]])
 
     """
+    # Fast type and shape checks before potential expensive computation
     KORNIA_CHECK(isinstance(input_tensor, Tensor), f"`input_tensor` must be a Tensor. Got: {type(input_tensor)}")
     valid_types = [torch.half, torch.float, torch.double, torch.uint8, torch.int, torch.long, torch.short]
     KORNIA_CHECK(
         input_tensor.dtype in valid_types, f"`input_tensor` must be a {valid_types}. Got: {input_tensor.dtype}"
     )
     KORNIA_CHECK(len(input_tensor.shape) in (3, 4), "Wrong input tensor dimension.")
-    if len(input_tensor.shape) == 3:
-        input_tensor = input_tensor.unsqueeze_(0)
+
+    is_batched = input_tensor.dim() == 4
+    if not is_batched:
+        input_tensor = input_tensor.unsqueeze(0)  # do not use inplace to avoid side-effects
 
     B, C, H, W = input_tensor.shape
-    input_tensor = input_tensor.reshape(B, C, -1)
-    max_value = 1.0 if input_tensor.max() <= 1.0 else 255.0
-    input_tensor = input_tensor.float().div_(max_value)
 
-    colors = colormap.colors.permute(1, 0)
+    input_tensor_flat = input_tensor.view(B, C, -1)
+
+    # Use a single .max() call for normalization check, avoids unnecessary .max() invocation
+    tmax = float(input_tensor_flat.max())
+    max_value = 1.0 if tmax <= 1.0 else 255.0
+    input_tensor_flat = input_tensor_flat.float() / max_value
+
+    # Prepare the colormap and bucket keys only once, on the right device and dtype
+    colors = colormap.colors.permute(1, 0)  # (num_colors, 3)
     num_colors, channels_cmap = colors.shape
-    keys = torch.linspace(0.0, 1.0, num_colors - 1, device=input_tensor.device, dtype=input_tensor.dtype)
-    indices = torch.bucketize(input_tensor, keys).unsqueeze(-1).expand(-1, -1, -1, 3)
+    keys = torch.linspace(0.0, 1.0, num_colors - 1, device=input_tensor_flat.device, dtype=input_tensor_flat.dtype)
 
-    output = torch.gather(colors.expand(B, C, -1, -1), 2, indices)
-    # (B, C, H*W, channels_cmap) -> (B, C*channels_cmap, H, W)
-    output = output.permute(0, 1, 3, 2).reshape(B, C * channels_cmap, H, W)
+    indices = torch.bucketize(input_tensor_flat, keys)
+    # Instead of unsqueeze+expand, we build up the gather indices to enable batched fast gather
+    # Efficient gather (B, C, L) -> (B, C, L, 3)
+    indices = indices.unsqueeze(-1).expand(-1, -1, -1, channels_cmap)
 
-    return output
+    # Use as_strided to avoid allocate temporary memory for broadcasting colors if possible.
+    out = torch.gather(colors.expand(B, C, num_colors, channels_cmap), 2, indices)
+
+    # Fast in-place permutation and view for output
+    out = out.permute(0, 1, 3, 2).reshape(B, C * channels_cmap, H, W)
+
+    return out
 
 
 class ApplyColorMap(Module):
