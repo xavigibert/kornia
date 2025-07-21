@@ -421,7 +421,7 @@ class LightGlue(Module):
         super().__init__()
         self.conf = conf = SimpleNamespace(**{**self.default_conf, **conf_})
         if features is not None:
-            KORNIA_CHECK(features in list(self.features.keys()), "Features keys are wrong")
+            KORNIA_CHECK(features in self.features, "Features keys are wrong")
             for k, v in self.features[features].items():
                 setattr(conf, k, v)
         KORNIA_CHECK(not (self.conf.add_scale_ori and self.conf.add_laf))  # we use either scale ori, or LAF
@@ -442,30 +442,30 @@ class LightGlue(Module):
         self.transformers = ModuleList([TransformerLayer(d, h, conf.flash) for _ in range(n)])
         self.log_assignment = ModuleList([MatchAssignment(d) for _ in range(n)])
         self.token_confidence = ModuleList([TokenConfidence(d) for _ in range(n - 1)])
+        # Precompute thresholds in list for efficient tensor construction
         self.register_buffer(
             "confidence_thresholds",
-            Tensor([self.confidence_threshold(i) for i in range(self.conf.n_layers)]),
+            torch.tensor([self.confidence_threshold(i) for i in range(self.conf.n_layers)], dtype=torch.float32),
         )
         state_dict = None
         if features is not None:
             fname = f"{conf.weights}_{self.version}.pth".replace(".", "-")
             if features == "dog_affnet_hardnet":
-                features = "doghardnet"  # new dog model is better for affnet as well
-            if features in ["keynet_affnet_hardnet"]:
+                features = "doghardnet"
+            if features == "keynet_affnet_hardnet":
                 fname = "keynet_affnet_hardnet_lightlue.pth"
                 url = "http://cmp.felk.cvut.cz/~mishkdmy/models/keynet_affnet_hardnet_lightlue.pth"
-            elif features in ["dedodeb"]:
+            elif features == "dedodeb":
                 fname = "dedodeb_lightglue.pth"
                 url = "http://cmp.felk.cvut.cz/~mishkdmy/models/dedodeb_lightglue.pth"
-            elif features in ["dedodeg"]:
+            elif features == "dedodeg":
                 fname = "dedodeg_lightglue.pth"
                 url = "http://cmp.felk.cvut.cz/~mishkdmy/models/dedodeg_lightglue.pth"
             else:
                 url = self.url.format(self.version, features)
             state_dict = torch.hub.load_state_dict_from_url(url, file_name=fname)
         elif conf.weights is not None:
-            path = Path(__file__).parent
-            path = path / f"weights/{self.conf.weights}.pth"
+            path = Path(__file__).parent / f"weights/{self.conf.weights}.pth"
             state_dict = torch.load(str(path), map_location="cpu")
         if state_dict:
             # rename old state dict entries
@@ -476,7 +476,6 @@ class LightGlue(Module):
                 state_dict = {k.replace(*pattern): v for k, v in state_dict.items()}
             self.load_state_dict(state_dict, strict=False)
         print("Loaded LightGlue model")
-        # static lengths LightGlue is compiled for (only used with torch.compile)
         self.static_lengths = None
 
     def compile(
@@ -689,9 +688,11 @@ class LightGlue(Module):
         num_points: int,
     ) -> Tensor:
         """Evaluate stopping condition."""
-        confidences = concatenate([confidences0, confidences1], -1)
+        # Combine confidences in the minimum memory way; calculate count directly
         threshold = self.confidence_thresholds[layer_index]
-        ratio_confident = 1.0 - (confidences < threshold).float().sum() / num_points
+        # Use torch.count_nonzero for better performance if available (PyTorch >= 1.6)
+        num_below = torch.count_nonzero(confidences0 < threshold) + torch.count_nonzero(confidences1 < threshold)
+        ratio_confident = 1.0 - (num_below / num_points)
         return ratio_confident > self.conf.depth_confidence
 
     def pruning_min_kpts(self, device: torch.device) -> int:
