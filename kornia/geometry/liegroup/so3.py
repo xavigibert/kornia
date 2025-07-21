@@ -224,21 +224,36 @@ class So3(Module):
                     [0., 0., 1.]], grad_fn=<StackBackward0>)
 
         """
-        w = self.q.w[..., None]
-        x, y, z = self.q.x[..., None], self.q.y[..., None], self.q.z[..., None]
-        q0 = 1 - 2 * y**2 - 2 * z**2
-        q1 = 2 * x * y - 2 * z * w
-        q2 = 2 * x * z + 2 * y * w
-        row0 = concatenate((q0, q1, q2), -1)
-        q0 = 2 * x * y + 2 * z * w
-        q1 = 1 - 2 * x**2 - 2 * z**2
-        q2 = 2 * y * z - 2 * x * w
-        row1 = concatenate((q0, q1, q2), -1)
-        q0 = 2 * x * z - 2 * y * w
-        q1 = 2 * y * z + 2 * x * w
-        q2 = 1 - 2 * x**2 - 2 * y**2
-        row2 = concatenate((q0, q1, q2), -1)
-        return stack((row0, row1, row2), -2)
+        # Retrieve quaternion components as (B,) tensors
+        q = self.q
+        w, x, y, z = q.w, q.x, q.y, q.z
+
+        # Precompute reused multiplicative terms
+        x2 = x + x
+        y2 = y + y
+        z2 = z + z
+        xx = x * x2
+        yy = y * y2
+        zz = z * z2
+        xy = x * y2
+        xz = x * z2
+        yz = y * z2
+        wx = w * x2
+        wy = w * y2
+        wz = w * z2
+
+        m00 = 1.0 - yy - zz
+        m01 = xy - wz
+        m02 = xz + wy
+        m10 = xy + wz
+        m11 = 1.0 - xx - zz
+        m12 = yz - wx
+        m20 = xz - wy
+        m21 = yz + wx
+        m22 = 1.0 - xx - yy
+
+        # Stack along last two dims to form rotation matrix efficiently
+        return stack((stack((m00, m01, m02), -1), stack((m10, m11, m12), -1), stack((m20, m21, m22), -1)), -2)
 
     @classmethod
     def from_matrix(cls, matrix: Tensor) -> So3:
