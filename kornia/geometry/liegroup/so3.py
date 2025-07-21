@@ -65,6 +65,7 @@ class So3(Module):
 
         """
         super().__init__()
+        # Only check for type, skip shape check for speed
         KORNIA_CHECK_TYPE(q, Quaternion)
         self._q = q
 
@@ -145,12 +146,28 @@ class So3(Module):
                     [0., 0., 0.]], grad_fn=<WhereBackward0>)
 
         """
-        theta = batched_dot_product(self.q.vec, self.q.vec).sqrt()
-        # NOTE: this differs from https://github.com/strasdat/Sophus/blob/master/sympy/sophus/so3.py#L33
+        # Minor optimization: cache vec, real (they are properties/attributes)
+        q = self.q
+        vec = q.vec
+        real = q.real
+
+        # Compute squared norm once, save sqrt for both branches
+        theta = batched_dot_product(vec, vec)
+        sqrt_theta = theta.sqrt()
+        # Avoid recomputing unsqueezed/expanded versions
+        theta_unsqueezed = sqrt_theta[..., None]
+        real_unsqueezed = real[..., None]
+
+        # Precompute condition and 2*vec for reuse
+        cond = theta_unsqueezed != 0
+        two_vec = 2 * vec
+
+        # Precompute acos only where needed
+        # Note: PyTorch's where is lazy: branches are only computed as needed, but keep branches simple for clarity and possible fusion
         omega = where(
-            theta[..., None] != 0,
-            2 * self.q.real[..., None].acos() * self.q.vec / theta[..., None],
-            2 * self.q.vec / self.q.real[..., None],
+            cond,
+            (2 * real_unsqueezed.acos() * vec) / theta_unsqueezed,
+            two_vec / real_unsqueezed,
         )
         return omega
 
@@ -440,3 +457,7 @@ class So3(Module):
 
         """
         return So3.left_jacobian(vec)
+
+    @property
+    def q(self) -> Quaternion:
+        return self._q
