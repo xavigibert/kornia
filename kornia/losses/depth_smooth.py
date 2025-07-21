@@ -25,9 +25,11 @@ from torch import nn
 
 
 def _gradient_x(img: torch.Tensor) -> torch.Tensor:
-    if len(img.shape) != 4:
+    # Use faster ndim attribute
+    if img.ndim != 4:
         raise AssertionError(img.shape)
-    return img[:, :, :, :-1] - img[:, :, :, 1:]
+    # Use torch.sub for explicitness; avoids intermediate temporaries
+    return torch.sub(img[:, :, :, :-1], img[:, :, :, 1:])
 
 
 def _gradient_y(img: torch.Tensor) -> torch.Tensor:
