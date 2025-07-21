@@ -104,6 +104,7 @@ class AIFI(Module):
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(dim_feedforward, embed_dim)
 
+        self._dropout_p = dropout  # cache value for speed in ffn
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(embed_dim)
@@ -127,7 +128,16 @@ class AIFI(Module):
         return x
 
     def ffn(self, x: Tensor) -> Tensor:
-        return self.linear2(self.dropout(self.act(self.linear1(x))))
+        # Optimization: If dropout is 0 during both train and eval, skip the Dropout op entirely
+        linear1 = self.linear1
+        act = self.act
+        linear2 = self.linear2
+        if not self.training or self._dropout_p == 0.0:
+            # in eval mode, or if p=0, dropout is identity
+            return linear2(act(linear1(x)))
+        else:
+            dropout = self.dropout
+            return linear2(dropout(act(linear1(x))))
 
     # TODO: make this into a reusable function
     # https://github.com/facebookresearch/moco-v3/blob/main/vits.py#L53
