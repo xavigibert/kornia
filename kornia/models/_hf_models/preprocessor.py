@@ -28,7 +28,8 @@ from kornia.geometry.transform import Resize
 class PreprocessingLoader:
     @staticmethod
     def normalize(mean: Tensor, std: Tensor) -> Normalize:
-        return Normalize(mean=mean, std=std)
+        # Use positional arguments for minimal overhead.
+        return Normalize(mean, std)
 
     @staticmethod
     def rescale(rescale_factor: float) -> Rescale:
