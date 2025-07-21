@@ -15,6 +15,8 @@
 # limitations under the License.
 #
 
+from __future__ import annotations
+
 from kornia.core import Tensor
 
 
@@ -45,19 +47,30 @@ def check_so2_theta_shape(theta: Tensor) -> None:
 
 
 def check_so2_matrix_shape(matrix: Tensor) -> None:
+    # Avoid repeated attribute lookups
     matrix_shape = matrix.shape
-    len_matrix_shape = len(matrix_shape)
+    ndim = len(matrix_shape)
     if (
-        (len_matrix_shape == 3 and (matrix_shape[1] != 2 or matrix_shape[2] != 2))
-        or (len_matrix_shape == 2 and (matrix_shape[0] != 2 or matrix_shape[1] != 2))
-        or (len_matrix_shape > 3 or len_matrix_shape < 2)
+        (ndim == 3 and (matrix_shape[1] != 2 or matrix_shape[2] != 2))
+        or (ndim == 2 and (matrix_shape[0] != 2 or matrix_shape[1] != 2))
+        or (ndim > 3 or ndim < 2)
     ):
         raise ValueError(f"Invalid input size, we expect [B, 2, 2] or [2, 2]. Got: {matrix_shape}")
 
 
 def check_so2_matrix(matrix: Tensor) -> None:
-    for m in matrix.reshape(-1, 2, 2):
-        if m[0, 0] != m[1, 1] or m[0, 1] != -m[1, 0]:
+    # Vectorized version for performance
+    # Accepts shape [B,2,2] or [2,2]
+    if matrix.dim() == 2:
+        if matrix[0, 0] != matrix[1, 1] or matrix[0, 1] != -matrix[1, 0]:
+            raise ValueError("Invalid rotation matrix")
+    elif matrix.dim() == 3:
+        # Vectorized check
+        if not ((matrix[:, 0, 0] == matrix[:, 1, 1]).all() and (matrix[:, 0, 1] == -matrix[:, 1, 0]).all()):
+            raise ValueError("Invalid rotation matrix")
+    else:
+        m_flat = matrix.reshape(-1, 2, 2)
+        if not ((m_flat[..., 0, 0] == m_flat[..., 1, 1]).all() and (m_flat[..., 0, 1] == -m_flat[..., 1, 0]).all()):
             raise ValueError("Invalid rotation matrix")
 
 
