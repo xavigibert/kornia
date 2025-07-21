@@ -35,32 +35,50 @@ from kornia.utils.image import perform_keep_shape_image, perform_keep_shape_vide
 
 
 def adjust_saturation_raw(image: Tensor, factor: Union[float, Tensor]) -> Tensor:
-    r"""Adjust color saturation of an image.
+    """Adjust color saturation of an image.
 
     Expecting image to be in hsv format already.
     """
-    KORNIA_CHECK_IS_TENSOR(image, "Expected shape (*, H, W)")
-    KORNIA_CHECK(isinstance(factor, (float, Tensor)), "Factor should be float or Tensor.")
+    # Fast path for shape/type check: will be optimized if called in a tight loop.
+    if not isinstance(image, Tensor):
+        raise TypeError("Expected shape (*, H, W)")
 
+    if not (isinstance(factor, float) or isinstance(factor, Tensor)):
+        raise Exception("Factor should be float or Tensor.")
+
+    # Efficient factor preparation
     if isinstance(factor, float):
-        # TODO: figure out how to create later a tensor without importing torch
-        factor = torch.as_tensor(factor, device=image.device, dtype=image.dtype)
-    elif isinstance(factor, Tensor):
-        factor = factor.to(image.device, image.dtype)
+        if factor == 1.0:
+            factor_tensor = None  # Means: skip all arithmetic!
+        else:
+            # fastest: make item with correctly shaped tensor only if needed
+            factor_tensor = torch.tensor(factor, device=image.device, dtype=image.dtype)
+    # Only convert dtype/device if incompatible at all
+    elif factor.device != image.device or factor.dtype != image.dtype:
+        factor_tensor = factor.to(device=image.device, dtype=image.dtype)
+    else:
+        factor_tensor = factor
 
-    # make factor broadcastable
-    while len(factor.shape) != len(image.shape):
-        factor = factor[..., None]
+    # Only broadcast factor if necessary (avoid loop and unnecessary copying)
+    # We optimize the loop to do as few .unsqueeze() as possible
+    if factor_tensor is not None and factor_tensor.shape != image.shape:
+        diff = len(image.shape) - len(factor_tensor.shape)
+        if diff > 0:
+            for _ in range(diff):
+                factor_tensor = factor_tensor.unsqueeze(-1)
 
-    # unpack the hsv values
+    # unpack the hsv values. This is fast so unchanged.
     h, s, v = torch.chunk(image, chunks=3, dim=-3)
 
-    # transform the hue value and appl module
-    s_out: Tensor = torch.clamp(s * factor, min=0, max=1)
+    # If factor is 1.0, skip unnecessary computation!
+    if isinstance(factor, float) and factor == 1.0:
+        s_out = s
+    else:
+        # s * factor (broadcasting applied as needed), then clamp
+        s_out = torch.clamp(s * (factor if factor_tensor is None else factor_tensor), min=0, max=1)
 
-    # pack back back the corrected hue
-    out: Tensor = torch.cat([h, s_out, v], dim=-3)
-
+    # pack back the result: concatenation is efficient at this shape/dtype.
+    out = torch.cat([h, s_out, v], dim=-3)
     return out
 
 
