@@ -26,6 +26,8 @@ from typing_extensions import TypeGuard
 
 from kornia.core import Tensor
 
+"""The testing package contains testing-specific utilities."""
+
 __all__ = [
     "KORNIA_CHECK",
     "KORNIA_CHECK_DM_DESC",
@@ -464,3 +466,15 @@ def _handle_invalid_range(msg: Optional[str], raises: bool, min_val: float | Ten
     if raises:
         raise ValueError(err_msg)
     return False
+
+
+def _broadcast_factor_to_shape(factor: Tensor, image_shape) -> Tensor:
+    # Efficiently unsqueeze factor until broadcastable with image.shape
+    # Only called for Tensor factor
+    unsq = len(image_shape) - len(factor.shape)
+    if unsq > 0:
+        # Use a single .view instead of chain of [..., None]
+        # Append ones to shape (batched factor)
+        new_shape = factor.shape + (1,) * unsq
+        return factor.view(new_shape)
+    return factor
