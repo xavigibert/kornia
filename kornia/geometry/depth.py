@@ -19,7 +19,7 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -30,8 +30,12 @@ from kornia.filters.sobel import spatial_gradient
 from kornia.utils import create_meshgrid
 
 from .camera import PinholeCamera, cam2pixel, pixel2cam, project_points, unproject_points
-from .conversions import normalize_pixel_coordinates, normalize_points_with_intrinsics
+from .conversions import convert_points_to_homogeneous, normalize_pixel_coordinates, normalize_points_with_intrinsics
 from .linalg import compose_transformations, convert_points_to_homogeneous, inverse_transformation, transform_points
+
+# The following is a fast LRU cache for (H, W, device, dtype) -> meshgrid tensor.
+# For general usage, 64 is plenty; bump if running on a broad set of shapes.
+_MESHGRID_CACHE: Dict[Tuple[int, int, torch.device, torch.dtype], Tensor] = {}
 
 __all__ = [
     "DepthWarper",
@@ -167,19 +171,15 @@ def depth_to_3d(depth: Tensor, camera_matrix: Tensor, normalize_points: bool = F
     KORNIA_CHECK_SHAPE(depth, ["B", "1", "H", "W"])
     KORNIA_CHECK_SHAPE(camera_matrix, ["B", "3", "3"])
 
-    # create base coordinates grid
-    _, _, height, width = depth.shape
-    points_2d: Tensor = create_meshgrid(height, width, normalized_coordinates=False)  # 1xHxWx2
-    points_2d = points_2d.to(depth.device).to(depth.dtype)
+    B, _, H, W = depth.shape
 
-    # depth should come in Bx1xHxW
-    points_depth: Tensor = depth.permute(0, 2, 3, 1)  # 1xHxWx1
+    # Efficiently get/copy meshgrid to needed device/dtype only once.
+    points_2d = create_meshgrid(H, W, normalized_coordinates=False, device=depth.device, dtype=depth.dtype)
+    # Since points_2d is shape (1, H, W, 2), broadcasting works for B batches below.
+    points_depth = depth.permute(0, 2, 3, 1)  # BxHxWx1
 
-    # project pixels to camera frame
-    camera_matrix_tmp: Tensor = camera_matrix[:, None, None]  # Bx1x1x3x3
-    points_3d: Tensor = unproject_points(
-        points_2d, points_depth, camera_matrix_tmp, normalize=normalize_points
-    )  # BxHxWx3
+    camera_matrix_exp = camera_matrix[:, None, None]  # Bx1x1x3x3
+    points_3d = unproject_points(points_2d, points_depth, camera_matrix_exp, normalize=normalize_points)  # BxHxWx3
 
     return points_3d.permute(0, 3, 1, 2)  # Bx3xHxW
 

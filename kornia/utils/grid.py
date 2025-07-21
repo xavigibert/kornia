@@ -15,12 +15,18 @@
 # limitations under the License.
 #
 
-from typing import Optional
+from __future__ import annotations
+
+from typing import Dict, Optional, Tuple
 
 import torch
 
 from kornia.core import Tensor, stack
 from kornia.utils._compat import torch_meshgrid
+
+# The following is a fast LRU cache for (H, W, device, dtype) -> meshgrid tensor.
+# For general usage, 64 is plenty; bump if running on a broad set of shapes.
+_MESHGRID_CACHE: Dict[Tuple[int, int, torch.device, torch.dtype], Tensor] = {}
 
 
 def create_meshgrid(
@@ -64,27 +70,30 @@ def create_meshgrid(
                   [1., 1.]]]])
 
     """
-    xs: Tensor = torch.linspace(0, width - 1, width, device=device, dtype=dtype)
-    ys: Tensor = torch.linspace(0, height - 1, height, device=device, dtype=dtype)
-    # Fix TracerWarning
-    # Note: normalize_pixel_coordinates still gots TracerWarning since new width and height
-    #       tensors will be generated.
-    # Below is the code using normalize_pixel_coordinates:
-    # base_grid: torch.Tensor = torch.stack(torch.meshgrid([xs, ys]), dim=2)
-    # if normalized_coordinates:
-    #     base_grid = K.geometry.normalize_pixel_coordinates(base_grid, height, width)
-    # return torch.unsqueeze(base_grid.transpose(0, 1), dim=0)
+    key = (
+        height,
+        width,
+        device if device is not None else torch.device("cpu"),
+        dtype if dtype is not None else torch.get_default_dtype(),
+        normalized_coordinates,
+    )
+    # Only cache for normalized_coordinates == False (most common for depth_to_3d), else use old way
+    if not normalized_coordinates:
+        cached = _MESHGRID_CACHE.get(key, None)
+        if cached is not None:
+            return cached
+    xs = torch.linspace(0, width - 1, width, device=device, dtype=dtype)
+    ys = torch.linspace(0, height - 1, height, device=device, dtype=dtype)
     if normalized_coordinates:
         xs = (xs / (width - 1) - 0.5) * 2
         ys = (ys / (height - 1) - 0.5) * 2
-    # generate grid by stacking coordinates
-    # TODO: torchscript doesn't like `torch_version_ge`
-    # if torch_version_ge(1, 13, 0):
-    #     x, y = torch_meshgrid([xs, ys], indexing="xy")
-    #     return stack([x, y], -1).unsqueeze(0)  # 1xHxWx2
-    # TODO: remove after we drop support of old versions
-    base_grid: Tensor = stack(torch_meshgrid([xs, ys], indexing="ij"), dim=-1)  # WxHx2
-    return base_grid.permute(1, 0, 2).unsqueeze(0)  # 1xHxWx2
+    base_grid = stack(torch_meshgrid([xs, ys], indexing="ij"), dim=-1)  # WxHx2
+    out = base_grid.permute(1, 0, 2).unsqueeze(0)  # 1xHxWx2
+    if not normalized_coordinates:
+        if len(_MESHGRID_CACHE) > 64:
+            _MESHGRID_CACHE.clear()
+        _MESHGRID_CACHE[key] = out
+    return out
 
 
 def create_meshgrid3d(

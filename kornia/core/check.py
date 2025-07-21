@@ -19,12 +19,17 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional, Sequence, TypeVar, cast
+from typing import Any, Dict, Optional, Sequence, Tuple, TypeVar, cast
 
+import torch
 from torch import float16, float32, float64
 from typing_extensions import TypeGuard
 
 from kornia.core import Tensor
+
+# The following is a fast LRU cache for (H, W, device, dtype) -> meshgrid tensor.
+# For general usage, 64 is plenty; bump if running on a broad set of shapes.
+_MESHGRID_CACHE: Dict[Tuple[int, int, torch.device, torch.dtype], Tensor] = {}
 
 __all__ = [
     "KORNIA_CHECK",
