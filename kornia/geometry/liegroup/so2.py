@@ -69,7 +69,6 @@ class So2(Module):
         """
         super().__init__()
         KORNIA_CHECK_IS_TENSOR(z)
-        # TODO change to KORNIA_CHECK_SHAPE once there is multiple shape support
         check_so2_z_shape(z)
         self._z = Parameter(z)
 
@@ -148,7 +147,10 @@ class So2(Module):
             tensor([1.2490], grad_fn=<Atan2Backward0>)
 
         """
-        return self.z.imag.atan2(self.z.real)
+        # Fast path: use torch.angle directly if available, which is faster than atan2 and is differentiable.
+        # torch.angle exists since torch 1.6 and is faster than computing atan2 manually.
+        # This avoids the need to separately access real and imag parts and call .atan2().
+        return self.z.angle()
 
     @staticmethod
     def hat(theta: Tensor) -> Tensor:
