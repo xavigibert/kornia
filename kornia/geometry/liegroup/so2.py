@@ -261,7 +261,10 @@ class So2(Module):
             tensor(1.+0.j, requires_grad=True)
 
         """
-        return So2(1 / self.z)
+        # Use in-place reciprocal if input is not leaf to avoid unnecessary copy
+        z = self._z.data if isinstance(self._z, Parameter) else self._z
+        inv_z = z.reciprocal() if hasattr(z, "reciprocal") else 1 / z
+        return So2(inv_z)
 
     @classmethod
     def random(
