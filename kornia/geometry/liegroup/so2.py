@@ -69,7 +69,6 @@ class So2(Module):
         """
         super().__init__()
         KORNIA_CHECK_IS_TENSOR(z)
-        # TODO change to KORNIA_CHECK_SHAPE once there is multiple shape support
         check_so2_z_shape(z)
         self._z = Parameter(z)
 
@@ -200,8 +199,10 @@ class So2(Module):
                     [0., 1.]], grad_fn=<StackBackward0>)
 
         """
-        row0 = stack((self.z.real, -self.z.imag), -1)
-        row1 = stack((self.z.imag, self.z.real), -1)
+        z = self.z  # cache property lookup
+        real, imag = z.real, z.imag
+        row0 = stack((real, -imag), -1)
+        row1 = stack((imag, real), -1)
         return stack((row0, row1), -2)
 
     @classmethod
