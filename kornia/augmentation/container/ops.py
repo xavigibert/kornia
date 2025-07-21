@@ -17,6 +17,7 @@
 
 import copy
 from abc import ABCMeta, abstractmethod
+from itertools import zip_longest
 from typing import Any, Callable, Dict, Generic, List, Optional, Type, TypeVar, Union
 
 from typing_extensions import ParamSpec
@@ -197,6 +198,14 @@ def get_geometric_only_param(module: "K.container.ImageSequentialBase", param: L
         if isinstance(mod, (K.GeometricAugmentationBase2D, K.GeometricAugmentationBase3D)):
             res.append(p)
     return res
+
+
+# Efficient utility to iterate reversed pairs for zip_longest, yielding pairs in reverse.
+def _reverse_zip_longest(seq1, seq2):
+    # Only reverse and materialize if both are not None
+    list1 = list(seq1) if seq1 is not None else []
+    list2 = list(seq2) if seq2 is not None else []
+    return zip_longest(reversed(list1), reversed(list2))
 
 
 class InputSequentialOps(SequentialOpsInterface[Tensor]):
@@ -483,13 +492,24 @@ class BoxSequentialOps(SequentialOpsInterface[Boxes]):
             param: the corresponding parameters to the module.
             extra_args: Optional dictionary of extra arguments with specific options for different input types.
         """
+        # Hoist commonly accessed types to locals for small attribute lookup speed gain
+        GAB2D = K.GeometricAugmentationBase2D
+        GAB3D = K.GeometricAugmentationBase3D
+        ImageSeq = K.ImageSequential
+        ContainerBase = K.container.ImageSequentialBase
+        OperationBase = K.auto.operations.OperationBase
+
+        # Only clone if path will mutate it (see below)
+        need_clone = False
+
         if extra_args is None:
             extra_args = {}
-        _input = input.clone()
 
-        if isinstance(module, (K.GeometricAugmentationBase2D,)):
+        # Case: geometric augmentation 2D
+        if isinstance(module, GAB2D):
             if module.transform_matrix is None:
                 raise ValueError(f"No valid transformation matrix found in {module.__class__}.")
+            _input = input.clone()
             transform = module.compute_inverse_transformation(module.transform_matrix)
             _input = module.inverse_boxes(
                 _input,
@@ -498,21 +518,34 @@ class BoxSequentialOps(SequentialOpsInterface[Boxes]):
                 transform=transform,
                 **extra_args,
             )
+            return _input
 
-        elif isinstance(module, (K.GeometricAugmentationBase3D,)):
+        # Case: geometric augmentation 3D
+        if isinstance(module, GAB3D):
             raise NotImplementedError(
                 "The support for 3d box operations are not yet supported. You are welcome to file a PR in our repo."
             )
 
-        elif isinstance(module, K.ImageSequential) and not module.is_intensity_only():
-            _input = module.inverse_boxes(_input, params=cls.get_sequential_module_param(param), extra_args=extra_args)
+        # Case: image sequential and not intensity only
+        if isinstance(module, ImageSeq):
+            # Only check is_intensity_only ONCE
+            if not module.is_intensity_only():
+                params_seq = cls.get_sequential_module_param(param)
+                # For image-sequential: just recurse, avoid unnecessary clone
+                return module.inverse_boxes(input, params=params_seq, extra_args=extra_args)
 
-        elif isinstance(module, K.container.ImageSequentialBase):
-            _input = module.inverse_boxes(_input, params=cls.get_sequential_module_param(param), extra_args=extra_args)
+        # Case: container ImageSequentialBase
+        if isinstance(module, ContainerBase):
+            params_seq = cls.get_sequential_module_param(param)
+            return module.inverse_boxes(input, params=params_seq, extra_args=extra_args)
 
-        elif isinstance(module, (K.auto.operations.OperationBase,)):
+        # Case: operationbase
+        if isinstance(module, OperationBase):
+            # Directly recurse, do not clone
             return BoxSequentialOps.inverse(input, module=module.op, param=param, extra_args=extra_args)
-        return _input
+
+        # Default: clone only if input mutation is required, else short-circuit
+        return input
 
 
 class KeypointSequentialOps(SequentialOpsInterface[Keypoints]):

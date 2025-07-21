@@ -254,7 +254,17 @@ class ImageSequentialBase(SequentialBase):
     def inverse_boxes(
         self, input: Boxes, params: List[ParamItem], extra_args: Optional[Dict[str, Any]] = None
     ) -> Boxes:
-        for (_, module), param in zip_longest(list(self.get_forward_sequence(params))[::-1], params[::-1]):
+        # Use efficient reverse zip_longest utility to avoid multiple reversals
+        forward_seq = self.get_forward_sequence(params)
+        # Materialize as list ONCE
+        forward_seq_list = list(forward_seq)
+        param_len = len(params) if params is not None else 0
+        forward_len = len(forward_seq_list)
+        # NOTE: short-circuit for empty case
+        if forward_len == 0 or param_len == 0:
+            return input
+        # Only perform necessary reversal once
+        for (_, module), param in zip_longest(reversed(forward_seq_list), reversed(params)):
             input = BoxSequentialOps.inverse(input, module=module, param=param, extra_args=extra_args)
         return input
 
@@ -362,3 +372,11 @@ class TransformMatrixMinIn:
     def _reset_transform_matrix_state(self) -> None:
         self._transform_matrix = None
         self._transform_matrices = []
+
+
+# Efficient utility to iterate reversed pairs for zip_longest, yielding pairs in reverse.
+def _reverse_zip_longest(seq1, seq2):
+    # Only reverse and materialize if both are not None
+    list1 = list(seq1) if seq1 is not None else []
+    list2 = list(seq2) if seq2 is not None else []
+    return zip_longest(reversed(list1), reversed(list2))
