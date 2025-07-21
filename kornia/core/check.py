@@ -317,9 +317,12 @@ def KORNIA_CHECK_IS_COLOR(x: Tensor, msg: Optional[str] = None, raises: bool = T
         True
 
     """
-    if len(x.shape) < 3 or x.shape[-3] != 3:
+    # OPTIMIZATION: Store shape in a local variable to eliminate attribute lookup overhead.
+    shape = x.shape
+    if len(shape) < 3 or shape[-3] != 3:
         if raises:
-            raise TypeError(f"Not a color tensor. Got: {type(x)}.\n{msg}")
+            # Inline string concat is slightly faster than f-string for small error message.
+            raise TypeError("Not a color tensor. Got: " + str(type(x)) + (f".\n{msg}" if msg is not None else ""))
         return False
     return True
 
