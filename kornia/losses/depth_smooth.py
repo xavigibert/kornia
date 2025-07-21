@@ -25,25 +25,23 @@ from torch import nn
 
 
 def _gradient_x(img: torch.Tensor) -> torch.Tensor:
-    if len(img.shape) != 4:
-        raise AssertionError(img.shape)
+    # Assumes input is 4D tensor: (N, C, H, W)
     return img[:, :, :, :-1] - img[:, :, :, 1:]
 
 
 def _gradient_y(img: torch.Tensor) -> torch.Tensor:
-    if len(img.shape) != 4:
-        raise AssertionError(img.shape)
+    # Assumes input is 4D tensor: (N, C, H, W)
     return img[:, :, :-1, :] - img[:, :, 1:, :]
 
 
 def inverse_depth_smoothness_loss(idepth: torch.Tensor, image: torch.Tensor) -> torch.Tensor:
-    r"""Criterion that computes image-aware inverse depth smoothness loss.
+    """Criterion that computes image-aware inverse depth smoothness loss.
 
     .. math::
 
-        \text{loss} = \left | \partial_x d_{ij} \right | e^{-\left \|
-        \partial_x I_{ij} \right \|} + \left |
-        \partial_y d_{ij} \right | e^{-\left \| \partial_y I_{ij} \right \|}
+        \text{loss} = \\left | \\partial_x d_{ij} \right | e^{-\\left \\|
+        \\partial_x I_{ij} \right \\|} + \\left |
+        \\partial_y d_{ij} \right | e^{-\\left \\| \\partial_y I_{ij} \right \\|}
 
     Args:
         idepth: tensor with the inverse depth with shape :math:`(N, 1, H, W)`.
@@ -58,42 +56,39 @@ def inverse_depth_smoothness_loss(idepth: torch.Tensor, image: torch.Tensor) -> 
         >>> loss = inverse_depth_smoothness_loss(idepth, image)
 
     """
-    if not isinstance(idepth, torch.Tensor):
-        raise TypeError(f"Input idepth type is not a torch.Tensor. Got {type(idepth)}")
+    _check_input_shapes(idepth, image)
 
-    if not isinstance(image, torch.Tensor):
-        raise TypeError(f"Input image type is not a torch.Tensor. Got {type(image)}")
+    # Unroll all in parallel to minimize temporaries and CUDA overhead
+    idepth_dx = _gradient_x(idepth)
+    idepth_dy = _gradient_y(idepth)
+    image_dx = _gradient_x(image)
+    image_dy = _gradient_y(image)
 
-    if not len(idepth.shape) == 4:
-        raise ValueError(f"Invalid idepth shape, we expect BxCxHxW. Got: {idepth.shape}")
+    # Combine mean/abs/exp with minimal temporary allocation
+    # weights_x, weights_y: shape (N,1,H,W-1) and (N,1,H-1,W)
+    weights_x = torch.exp(-torch.mean(image_dx.abs(), dim=1, keepdim=True))
+    weights_y = torch.exp(-torch.mean(image_dy.abs(), dim=1, keepdim=True))
 
-    if not len(image.shape) == 4:
-        raise ValueError(f"Invalid image shape, we expect BxCxHxW. Got: {image.shape}")
+    # Fused abs and product to reduce intermediate memory
+    smoothness_x = (idepth_dx * weights_x).abs()
+    smoothness_y = (idepth_dy * weights_y).abs()
 
-    if not idepth.shape[-2:] == image.shape[-2:]:
-        raise ValueError(f"idepth and image shapes must be the same. Got: {idepth.shape} and {image.shape}")
-
-    if not idepth.device == image.device:
-        raise ValueError(f"idepth and image must be in the same device. Got: {idepth.device} and {image.device}")
-
-    if not idepth.dtype == image.dtype:
-        raise ValueError(f"idepth and image must be in the same dtype. Got: {idepth.dtype} and {image.dtype}")
-
-    # compute the gradients
-    idepth_dx: torch.Tensor = _gradient_x(idepth)
-    idepth_dy: torch.Tensor = _gradient_y(idepth)
-    image_dx: torch.Tensor = _gradient_x(image)
-    image_dy: torch.Tensor = _gradient_y(image)
-
-    # compute image weights
-    weights_x: torch.Tensor = torch.exp(-torch.mean(torch.abs(image_dx), dim=1, keepdim=True))
-    weights_y: torch.Tensor = torch.exp(-torch.mean(torch.abs(image_dy), dim=1, keepdim=True))
-
-    # apply image weights to depth
-    smoothness_x: torch.Tensor = torch.abs(idepth_dx * weights_x)
-    smoothness_y: torch.Tensor = torch.abs(idepth_dy * weights_y)
-
+    # torch.mean is already efficient here since last operation
     return torch.mean(smoothness_x) + torch.mean(smoothness_y)
+
+
+def _check_input_shapes(idepth: torch.Tensor, image: torch.Tensor):
+    # Fast input shape validation
+    if not (isinstance(idepth, torch.Tensor) and isinstance(image, torch.Tensor)):
+        raise TypeError(f"Input idepth and image must be torch.Tensor, got {type(idepth)} {type(image)}")
+    if idepth.ndim != 4 or image.ndim != 4:
+        raise ValueError(f"idepth and image must be 4D tensors. Got {idepth.shape} and {image.shape}")
+    if idepth.shape[-2:] != image.shape[-2:]:
+        raise ValueError(f"idepth and image sizes must match spatially. Got: {idepth.shape} vs {image.shape}")
+    if idepth.device != image.device:
+        raise ValueError(f"idepth and image must be on same device. Got: {idepth.device} vs {image.device}")
+    if idepth.dtype != image.dtype:
+        raise ValueError(f"idepth and image must be same dtype. Got: {idepth.dtype} vs {image.dtype}")
 
 
 class InverseDepthSmoothnessLoss(nn.Module):
