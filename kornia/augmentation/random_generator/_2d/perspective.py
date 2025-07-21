@@ -21,9 +21,8 @@ import torch
 from torch.distributions import Uniform
 
 from kornia.augmentation.random_generator.base import RandomGeneratorBase
-from kornia.augmentation.utils import _adapted_rsampling, _common_param_check
+from kornia.augmentation.utils import _adapted_rsampling
 from kornia.core import Tensor, tensor
-from kornia.utils.helpers import _extract_device_dtype
 
 __all__ = ["PerspectiveGenerator"]
 
@@ -70,34 +69,68 @@ class PerspectiveGenerator(RandomGeneratorBase):
         )
 
     def forward(self, batch_shape: Tuple[int, ...], same_on_batch: bool = False) -> Dict[str, Tensor]:
+        # Fast-path: use local variables and minimize device/dtype extraction
         batch_size = batch_shape[0]
         height = batch_shape[-2]
         width = batch_shape[-1]
 
-        _device, _dtype = _extract_device_dtype([self.distortion_scale])
-        _common_param_check(batch_size, same_on_batch)
+        # Early parameter checking
+        if not (isinstance(batch_size, int) and batch_size >= 0):
+            raise AssertionError(f"`batch_size` shall be a positive integer. Got {batch_size}.")
+        if same_on_batch is not None and not isinstance(same_on_batch, bool):
+            raise AssertionError(f"`same_on_batch` shall be boolean. Got {same_on_batch}.")
         if not (isinstance(height, int) and height > 0 and isinstance(width, int) and width > 0):
             raise AssertionError(f"'height' and 'width' must be integers. Got {height}, {width}.")
 
-        start_points: Tensor = tensor(
-            [[[0.0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]]], device=_device, dtype=_dtype
-        ).expand(batch_size, -1, -1)
+        # Use fast path for device/dtype extraction
+        d_scale = self.distortion_scale
+        if isinstance(d_scale, Tensor):
+            device = d_scale.device
+            dtype = d_scale.dtype
+        else:
+            device = torch.device("cpu")
+            dtype = torch.get_default_dtype()
+        _device = device
+        _dtype = dtype
 
-        # generate random offset not larger than half of the image
-        fx = self._distortion_scale * width / 2
-        fy = self._distortion_scale * height / 2
-
-        factor = torch.stack([fx, fy], dim=0).view(-1, 1, 2).to(device=_device, dtype=_dtype)
-
-        # TODO: This line somehow breaks the gradcheck
-        rand_val: Tensor = _adapted_rsampling(start_points.shape, self.rand_val_sampler, same_on_batch).to(
-            device=_device, dtype=_dtype
+        base_corners = torch.tensor(
+            [[0.0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]],
+            device=_device,
+            dtype=_dtype,
         )
+        start_points = base_corners.unsqueeze(0).expand(batch_size, -1, -1)
+
+        # Compute fx, fy directly without extra indirection
+        _dscale = (
+            d_scale
+            if isinstance(d_scale, float)
+            else d_scale.item()
+            if isinstance(d_scale, Tensor) and d_scale.numel() == 1
+            else d_scale
+        )
+        fx = _dscale * width / 2
+        fy = _dscale * height / 2
+
+        # Construct factor tensor more efficiently
+        factor = torch.tensor([[fx, fy]], device=_device, dtype=_dtype)  # shape (1,2)
+        factor = factor.unsqueeze(1)  # shape (1,1,2), broadcastable to (B,4,2)
+
+        # Generate random values once, already on target device/dtype
+        rand_shape = (batch_size, 4, 2)
+        rand_val = _adapted_rsampling(rand_shape, self.rand_val_sampler, same_on_batch)
+        if rand_val.device != _device or rand_val.dtype != _dtype:
+            rand_val = rand_val.to(device=_device, dtype=_dtype)
+
         if self.sampling_method == "basic":
-            pts_norm = tensor([[[1, 1], [-1, 1], [-1, -1], [1, -1]]], device=_device, dtype=_dtype)
+            # Use constant pts_norm tensor, allocate once
+            pts_norm = torch.tensor(
+                [[[1.0, 1.0], [-1.0, 1.0], [-1.0, -1.0], [1.0, -1.0]]], device=_device, dtype=_dtype
+            )
             offset = factor * rand_val * pts_norm
         elif self.sampling_method == "area_preserving":
             offset = 2 * factor * (rand_val - 0.5)
+        else:
+            raise NotImplementedError(f"Sampling method {self.sampling_method} not yet implemented.")
 
         end_points = start_points + offset
 
