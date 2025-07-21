@@ -176,10 +176,15 @@ class SequentialBase(BasicSequentialBase):
         If input tensor dim is smaller than the lower bound of dim_range, an error will be thrown out.
         """
         ori_shape = input.shape
-        if len(ori_shape) < dim_range[0] or len(ori_shape) > dim_range[1]:
+        n_dim = len(ori_shape)
+        min_dim, max_dim = dim_range
+        if n_dim < min_dim or n_dim > max_dim:
             raise RuntimeError(f"input shape expected to be in {dim_range} while got {ori_shape}.")
-        while len(input.shape) < dim_range[1]:
-            input = input[None]
+        # Add all required leading singleton dimensions at once (no loop)
+        if n_dim < max_dim:
+            num_to_add = max_dim - n_dim
+            new_shape = (1,) * num_to_add + ori_shape
+            input = input.reshape(new_shape)
         return ori_shape, input.shape
 
 
