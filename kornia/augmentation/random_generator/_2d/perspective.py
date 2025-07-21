@@ -58,8 +58,17 @@ class PerspectiveGenerator(RandomGeneratorBase):
         self.sampling_method = sampling_method
 
     def __repr__(self) -> str:
-        repr = f"distortion_scale={self.distortion_scale}"
-        return repr
+        # Optimized: avoid f-string and full Tensor print.
+        ds = self.distortion_scale
+        if isinstance(ds, Tensor):
+            # Avoids expensive string conversion/sync for big tensors
+            # Show scalar value if possible
+            if ds.ndim == 0:
+                value = ds.item()
+            else:
+                value = f"Tensor(shape={tuple(ds.shape)}, dtype={ds.dtype})"
+            return "distortion_scale=" + str(value)
+        return "distortion_scale=" + str(ds)
 
     def make_samplers(self, device: torch.device, dtype: torch.dtype) -> None:
         self._distortion_scale = torch.as_tensor(self.distortion_scale, device=device, dtype=dtype)
