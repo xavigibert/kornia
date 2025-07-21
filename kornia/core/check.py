@@ -341,11 +341,18 @@ def KORNIA_CHECK_IS_GRAY(x: Tensor, msg: Optional[str] = None, raises: bool = Tr
         True
 
     """
-    if len(x.shape) < 2 or (len(x.shape) >= 3 and x.shape[-3] != 1):
-        if raises:
-            raise TypeError(f"Not a gray tensor. Got: {type(x)}.\n{msg}")
-        return False
-    return True
+    shape = x.shape
+    ndim = len(shape)
+    # Fast path branch, combine checks to single if with early return for common correct case
+    if ndim >= 3:
+        if shape[-3] == 1:
+            return True
+    elif ndim == 2:
+        return True
+
+    if raises:
+        raise TypeError(f"Not a gray tensor. Got: {type(x)}.\n{msg}")
+    return False
 
 
 def KORNIA_CHECK_IS_COLOR_OR_GRAY(x: Tensor, msg: Optional[str] = None, raises: bool = True) -> bool:
