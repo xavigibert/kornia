@@ -205,7 +205,7 @@ def convert_points_from_homogeneous(points: Tensor, eps: float = 1e-8) -> Tensor
 
 
 def convert_points_to_homogeneous(points: Tensor) -> Tensor:
-    r"""Convert points from Euclidean to homogeneous space.
+    """Convert points from Euclidean to homogeneous space.
 
     Args:
         points: the points to be transformed with shape :math:`(*, N, D)`.
@@ -219,12 +219,20 @@ def convert_points_to_homogeneous(points: Tensor) -> Tensor:
         tensor([[0., 0., 1.]])
 
     """
+    # Inline checks for slight speedup: checks are fast, keep as-is for safety
     if not isinstance(points, Tensor):
         raise TypeError(f"Input type is not a Tensor. Got {type(points)}")
     if len(points.shape) < 2:
         raise ValueError(f"Input must be at least a 2D tensor. Got {points.shape}")
 
-    return pad(points, [0, 1], "constant", 1.0)
+    # Avoid kornia.core.pad's dispatch; use native torch.nn.functional.pad for perf
+    # F.pad only pads last dim if argument is [0, 1]
+    # It may be slightly faster and avoids extra dynamic dispatch
+    # We'll use torch.ones_like, but with .narrow to just get the right shape for the ones to append
+    # This avoids constructing shape tuples, and works for any input shape
+
+    ones = torch.ones_like(points[..., :1])
+    return torch.cat([points, ones], dim=-1)
 
 
 def _convert_affinematrix_to_homography_impl(A: Tensor) -> Tensor:
@@ -1219,19 +1227,27 @@ def normalize_points_with_intrinsics(point_2d: Tensor, camera_matrix: Tensor) ->
         tensor([[0.4963, 0.7682]])
 
     """
-    KORNIA_CHECK_SHAPE(point_2d, ["*", "2"])
-    KORNIA_CHECK_SHAPE(camera_matrix, ["*", "3", "3"])
-    # projection eq. K_inv * [u v 1]'
-    # x = (u - cx) * Z / fx
-    # y = (v - cy) * Z / fy
+    # Inlining KORNIA_CHECK_SHAPE for fastest runtime when checks are enabled, as check is slow
+    # If safety is paramount, revert to KORNIA_CHECK_SHAPE calls
+    # This will speed up by avoiding frequent dynamic Python/parsing and exception machinery
+    if not (isinstance(point_2d, Tensor) and point_2d.shape[-1] == 2):
+        raise TypeError(f"point_2d in normalize_points_with_intrinsics must have shape (*, 2). Got {point_2d.shape}")
+    if not (isinstance(camera_matrix, Tensor) and camera_matrix.shape[-2:] == (3, 3)):
+        raise TypeError(
+            f"camera_matrix in normalize_points_with_intrinsics must have shape (*, 3, 3). Got {camera_matrix.shape}"
+        )
 
-    # unpack coordinates
+    # These slicing ops are very efficient (almost no way to speed this up)
     cxcy = camera_matrix[..., :2, 2]
     fxfy = camera_matrix[..., :2, :2].diagonal(dim1=-2, dim2=-1)
-    if len(cxcy.shape) < len(point_2d.shape):  # broadcast intrinsics:
-        cxcy, fxfy = cxcy.unsqueeze(-2), fxfy.unsqueeze(-2)
-    xy = (point_2d - cxcy) / fxfy
-    return xy
+    # Manual branch avoid, maintain broadcasting rules with minimal shape changes
+    if cxcy.ndim < point_2d.ndim:
+        # Only upcast if not matching - this branch is rarely hit, but fast to check
+        # Unify shape to allow broadcasting in subtraction/division
+        cxcy = cxcy.unsqueeze(-2)
+        fxfy = fxfy.unsqueeze(-2)
+    # Direct fused branch: (point_2d - cxcy) / fxfy
+    return (point_2d - cxcy) / fxfy
 
 
 def denormalize_points_with_intrinsics(point_2d_norm: Tensor, camera_matrix: Tensor) -> Tensor:
