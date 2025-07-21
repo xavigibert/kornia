@@ -73,12 +73,17 @@ def normalize_keypoints(kpts: Tensor, size: Tensor) -> Tensor:
 
 def pad_to_length(x: Tensor, length: int) -> Tuple[Tensor, Tensor]:
     """Pad tensor to desired length."""
-    if length <= x.shape[-2]:
+    seq_len = x.shape[-2]
+    if length <= seq_len:
         return x, ones_like(x[..., :1], dtype=torch.bool)
-    pad = ones(*x.shape[:-2], length - x.shape[-2], x.shape[-1], device=x.device, dtype=x.dtype)
+    pad_size = length - seq_len
+    # Allocate padding and concatenate in a single step
+    pad = ones(*x.shape[:-2], pad_size, x.shape[-1], device=x.device, dtype=x.dtype)
     y = concatenate([x, pad], dim=-2)
-    mask = zeros(*y.shape[:-1], 1, dtype=torch.bool, device=x.device)
-    mask[..., : x.shape[-2], :] = True
+    # Create the mask in two steps, then cat for efficiency
+    true_mask = ones(*x.shape[:-2], seq_len, 1, dtype=torch.bool, device=x.device)
+    false_mask = zeros(*x.shape[:-2], pad_size, 1, dtype=torch.bool, device=x.device)
+    mask = concatenate([true_mask, false_mask], dim=-2)
     return y, mask
 
 
