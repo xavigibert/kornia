@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Any
 
 from kornia.core import ImageSequential, Module, Tensor, tensor
@@ -31,7 +32,9 @@ class PreprocessingLoader:
         return Normalize(mean=mean, std=std)
 
     @staticmethod
+    @lru_cache(maxsize=16)
     def rescale(rescale_factor: float) -> Rescale:
+        # Cache constructed Rescale instances to minimize object creation
         return Rescale(factor=rescale_factor)
 
     @staticmethod
