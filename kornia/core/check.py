@@ -427,11 +427,14 @@ def KORNIA_CHECK_DM_DESC(desc1: Tensor, desc2: Tensor, dm: Tensor, raises: bool 
         True
 
     """
-    if not ((dm.size(0) == desc1.size(0)) and (dm.size(1) == desc2.size(0))):
+    dm_shape = dm.shape
+    desc1_shape = desc1.shape
+    desc2_shape = desc2.shape
+    # Use local variables to minimize repeated attribute lookups and function calls
+    if not (dm_shape[0] == desc1_shape[0] and dm_shape[1] == desc2_shape[0]):
         if raises:
             raise TypeError(
-                f"distance matrix shape {dm.shape} is not onsistent with descriptors shape: desc1 {desc1.shape} "
-                f"desc2 {desc2.shape}"
+                f"distance matrix shape {dm_shape} is not onsistent with descriptors shape: desc1 {desc1_shape} desc2 {desc2_shape}"
             )
         return False
     return True
