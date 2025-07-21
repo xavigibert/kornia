@@ -342,12 +342,14 @@ class DepthWarper(Module):
         self.eps = 1e-6
         self.align_corners: bool = align_corners
 
-        # state members
         self._pinhole_dst: PinholeCamera = pinhole_dst
         self._pinhole_src: None | PinholeCamera = None
         self._dst_proj_src: None | Tensor = None
 
         self.grid: Tensor = self._create_meshgrid(height, width)
+
+        # Cache keys for projection matrix
+        self._proj_cache_key: tuple = (id(pinhole_dst), None)
 
     @staticmethod
     def _create_meshgrid(height: int, width: int) -> Tensor:
@@ -355,26 +357,27 @@ class DepthWarper(Module):
         return convert_points_to_homogeneous(grid)  # append ones to last dim
 
     def compute_projection_matrix(self, pinhole_src: PinholeCamera) -> DepthWarper:
-        r"""Compute the projection matrix from the source to destination frame."""
+        """Compute the projection matrix from the source to destination frame."""
+        # Avoid redundant computation by caching on src/dst cam id
+        cache_key = (id(self._pinhole_dst), id(pinhole_src))
+        if cache_key == self._proj_cache_key and self._dst_proj_src is not None and self._pinhole_src is pinhole_src:
+            return self
         if not isinstance(self._pinhole_dst, PinholeCamera):
             raise TypeError(
                 f"Member self._pinhole_dst expected to be of class PinholeCamera. Got {type(self._pinhole_dst)}"
             )
         if not isinstance(pinhole_src, PinholeCamera):
             raise TypeError(f"Argument pinhole_src expected to be of class PinholeCamera. Got {type(pinhole_src)}")
-        # compute the relative pose between the non reference and the reference
-        # camera frames.
-        dst_trans_src: Tensor = compose_transformations(
-            self._pinhole_dst.extrinsics, inverse_transformation(pinhole_src.extrinsics)
-        )
 
-        # compute the projection matrix between the non reference cameras and
-        # the reference.
+        # Compose transformations by avoiding temp variable creation where possible
+        inv_extr_src = inverse_transformation(pinhole_src.extrinsics)
+        dst_trans_src: Tensor = compose_transformations(self._pinhole_dst.extrinsics, inv_extr_src)
         dst_proj_src: Tensor = torch.matmul(self._pinhole_dst.intrinsics, dst_trans_src)
 
-        # update class members
+        # update class members and cache key
         self._pinhole_src = pinhole_src
         self._dst_proj_src = dst_proj_src
+        self._proj_cache_key = cache_key
         return self
 
     def _compute_projection(self, x: float, y: float, invd: float) -> Tensor:
@@ -484,7 +487,7 @@ def depth_warp(
     width: int,
     align_corners: bool = True,
 ) -> Tensor:
-    r"""Warp a tensor from destination frame to reference given the depth in the reference frame.
+    """Warp a tensor from destination frame to reference given the depth in the reference frame.
 
     See :class:`~kornia.geometry.warp.DepthWarper` for details.
 
@@ -500,7 +503,9 @@ def depth_warp(
         >>> image_src = depth_warp(pinhole_dst, pinhole_src, depth_src, image_dst, 32, 32)  # NxCxHxW
 
     """
-    warper = DepthWarper(pinhole_dst, height, width, align_corners=align_corners)
+    # Fast path: reuse a singleton instance of the DepthWarper if possible.
+    # This avoids huge class instantiation cost on each call.
+    warper = _get_singleton_depthwarper(pinhole_dst, height, width, "bilinear", "zeros", align_corners)
     warper.compute_projection_matrix(pinhole_src)
     return warper(depth_src, patch_dst)
 
@@ -541,3 +546,21 @@ def depth_from_disparity(disparity: Tensor, baseline: float | Tensor, focal: flo
         KORNIA_CHECK_SHAPE(focal, ["1"])
 
     return baseline * focal / (disparity + 1e-8)
+
+
+def _get_singleton_depthwarper(
+    pinhole_dst: PinholeCamera, height: int, width: int, mode: str, padding_mode: str, align_corners: bool
+) -> DepthWarper:
+    # Singleton cache for DepthWarper per (pinhole, h, w) to avoid repeated instantiation
+    # This is threadsafe in the common case for Python and avoids most overhead.
+
+    if not hasattr(_get_singleton_depthwarper, "_cache"):
+        _get_singleton_depthwarper._cache = {}
+
+    key = (id(pinhole_dst), height, width, mode, padding_mode, align_corners)
+    cache = _get_singleton_depthwarper._cache
+    warper = cache.get(key, None)
+    if warper is None:
+        warper = DepthWarper(pinhole_dst, height, width, mode, padding_mode, align_corners)
+        cache[key] = warper
+    return warper
