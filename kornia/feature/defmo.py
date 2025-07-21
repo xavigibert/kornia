@@ -302,20 +302,16 @@ class DeFMO(Module):
         super().__init__()
         self.encoder = EncoderDeFMO()
         self.rendering = RenderingDeFMO()
-
-        # use torch.hub to load pretrained model
         if pretrained:
-            pretrained_dict = torch.hub.load_state_dict_from_url(
-                urls["defmo_encoder"], map_location=torch.device("cpu")
+            # Download and load model weights more efficiently
+            self.encoder.load_state_dict(
+                torch.hub.load_state_dict_from_url(urls["defmo_encoder"], map_location="cpu"), strict=True
             )
-            self.encoder.load_state_dict(pretrained_dict, strict=True)
-            pretrained_dict_ren = torch.hub.load_state_dict_from_url(
-                urls["defmo_rendering"], map_location=torch.device("cpu")
+            self.rendering.load_state_dict(
+                torch.hub.load_state_dict_from_url(urls["defmo_rendering"], map_location="cpu"), strict=True
             )
-            self.rendering.load_state_dict(pretrained_dict_ren, strict=True)
-        self.eval()
+        self.eval()  # Set to eval mode after loading weights
 
     def forward(self, input_data: Tensor) -> Tensor:
-        latent = self.encoder(input_data)
-        x_out = self.rendering(latent)
-        return x_out
+        # Directly pass through both modules for fast computation
+        return self.rendering(self.encoder(input_data))
