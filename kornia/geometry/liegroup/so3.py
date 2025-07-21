@@ -206,14 +206,14 @@ class So3(Module):
         return stack((a, b, c), -1)
 
     def matrix(self) -> Tensor:
-        r"""Convert the quaternion to a rotation matrix of shape :math:`(B,3,3)`.
+        """Convert the quaternion to a rotation matrix of shape :math:`(B,3,3)`.
 
         The matrix is of the form:
 
         .. math::
             \begin{bmatrix} 1-2y^2-2z^2 & 2xy-2zw & 2xy+2yw \\
             2xy+2zw & 1-2x^2-2z^2 & 2yz-2xw \\
-            2xz-2yw & 2yz+2xw & 1-2x^2-2y^2\end{bmatrix}
+            2xz-2yw & 2yz+2xw & 1-2x^2-2y^2\\end{bmatrix}
 
         Example:
             >>> s = So3.identity()
@@ -224,21 +224,31 @@ class So3(Module):
                     [0., 0., 1.]], grad_fn=<StackBackward0>)
 
         """
-        w = self.q.w[..., None]
-        x, y, z = self.q.x[..., None], self.q.y[..., None], self.q.z[..., None]
-        q0 = 1 - 2 * y**2 - 2 * z**2
-        q1 = 2 * x * y - 2 * z * w
-        q2 = 2 * x * z + 2 * y * w
-        row0 = concatenate((q0, q1, q2), -1)
-        q0 = 2 * x * y + 2 * z * w
-        q1 = 1 - 2 * x**2 - 2 * z**2
-        q2 = 2 * y * z - 2 * x * w
-        row1 = concatenate((q0, q1, q2), -1)
-        q0 = 2 * x * z - 2 * y * w
-        q1 = 2 * y * z + 2 * x * w
-        q2 = 1 - 2 * x**2 - 2 * y**2
-        row2 = concatenate((q0, q1, q2), -1)
-        return stack((row0, row1, row2), -2)
+        # Extract the internal tensor representation just once
+        data = self.q.data
+        w, x, y, z = data[..., 0], data[..., 1], data[..., 2], data[..., 3]
+        # Compute products only once to save time
+        ww = w
+        xx = x
+        yy = y
+        zz = z
+
+        xx2 = 2 * xx * xx
+        yy2 = 2 * yy * yy
+        zz2 = 2 * zz * zz
+        xy2 = 2 * x * y
+        yz2 = 2 * y * z
+        zx2 = 2 * z * x
+        xw2 = 2 * x * w
+        yw2 = 2 * y * w
+        zw2 = 2 * z * w
+
+        # Use stack to directly batch construct the matrix - avoids lots of slice/copy/reshape
+        row0 = stack((1 - yy2 - zz2, xy2 - zw2, zx2 + yw2), dim=-1)
+        row1 = stack((xy2 + zw2, 1 - xx2 - zz2, yz2 - xw2), dim=-1)
+        row2 = stack((zx2 - yw2, yz2 + xw2, 1 - xx2 - yy2), dim=-1)
+        # Stack on the correct axis to produce output shape (B, 3, 3)
+        return stack((row0, row1, row2), dim=-2)
 
     @classmethod
     def from_matrix(cls, matrix: Tensor) -> So3:
