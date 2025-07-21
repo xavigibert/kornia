@@ -222,20 +222,30 @@ class InputSequentialOps(SequentialOpsInterface[Tensor]):
     def inverse(
         cls, input: Tensor, module: Module, param: ParamItem, extra_args: Optional[Dict[str, Any]] = None
     ) -> Tensor:
-        if extra_args is None:
-            extra_args = {}
-        if isinstance(module, K.GeometricAugmentationBase2D):
-            input = module.inverse(input, params=cls.get_instance_module_param(param), **extra_args)
-        elif isinstance(module, (K.GeometricAugmentationBase3D,)):
+        # Use a local variable for extra_args if None for efficiency.
+        extra = extra_args if extra_args is not None else {}
+
+        # Cache commonly used references
+        geo_aug2d = K.GeometricAugmentationBase2D
+        geo_aug3d = K.GeometricAugmentationBase3D
+        op_base = K.auto.operations.OperationBase
+        img_seq = K.ImageSequential
+        img_seq_base = K.container.ImageSequentialBase
+
+        if isinstance(module, geo_aug2d):
+            return module.inverse(input, params=cls.get_instance_module_param(param), **extra)
+        if isinstance(module, geo_aug3d):
             raise NotImplementedError(
                 "The support for 3d inverse operations are not yet supported. You are welcome to file a PR in our repo."
             )
-        elif isinstance(module, (K.auto.operations.OperationBase,)):
-            return InputSequentialOps.inverse(input, module=module.op, param=param, extra_args=extra_args)
-        elif isinstance(module, K.ImageSequential) and not module.is_intensity_only():
-            input = module.inverse_inputs(input, params=cls.get_sequential_module_param(param), extra_args=extra_args)
-        elif isinstance(module, K.container.ImageSequentialBase):
-            input = module.inverse_inputs(input, params=cls.get_sequential_module_param(param), extra_args=extra_args)
+        if isinstance(module, op_base):
+            # Unwind wrappers directly to minimize stack depth
+            return cls.inverse(input, module=module.op, param=param, extra_args=extra)
+        if isinstance(module, img_seq) and not module.is_intensity_only():
+            return module.inverse_inputs(input, params=cls.get_sequential_module_param(param), extra_args=extra)
+        if isinstance(module, img_seq_base):
+            return module.inverse_inputs(input, params=cls.get_sequential_module_param(param), extra_args=extra)
+        # Fallback: just return the input unmodified
         return input
 
 

@@ -224,7 +224,10 @@ class ImageSequentialBase(SequentialBase):
     def inverse_inputs(
         self, input: Tensor, params: List[ParamItem], extra_args: Optional[Dict[str, Any]] = None
     ) -> Tensor:
-        for (_, module), param in zip_longest(list(self.get_forward_sequence(params))[::-1], params[::-1]):
+        # Use reversed() for better performance and less memory than list(...)[::-1]
+        forward_seq_reversed = reversed(list(self.get_forward_sequence(params)))
+        params_reversed = reversed(params)
+        for (_, module), param in zip_longest(forward_seq_reversed, params_reversed):
             input = InputSequentialOps.inverse(input, module=module, param=param, extra_args=extra_args)
         return input
 
