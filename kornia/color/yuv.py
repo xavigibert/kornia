@@ -69,7 +69,7 @@ def rgb_to_yuv(image: Tensor) -> Tensor:
 
 
 def rgb_to_yuv420(image: Tensor) -> tuple[Tensor, Tensor]:
-    r"""Convert an RGB image to YUV 420 (subsampled).
+    """Convert an RGB image to YUV 420 (subsampled).
 
     Input need to be padded to be evenly divisible by 2 horizontal and vertical.
 
@@ -101,12 +101,33 @@ def rgb_to_yuv420(image: Tensor) -> tuple[Tensor, Tensor]:
     if len(image.shape) < 2 or image.shape[-2] % 2 == 1 or image.shape[-1] % 2 == 1:
         raise ValueError(f"Input H&W must be evenly disible by 2. Got {image.shape}")
 
-    yuvimage = rgb_to_yuv(image)
+    # Fast fused computation for Y, U, V channels
+    r = image[..., 0, :, :]
+    g = image[..., 1, :, :]
+    b = image[..., 2, :, :]
+    y = 0.299 * r + 0.587 * g + 0.114 * b
+    u = -0.147 * r - 0.289 * g + 0.436 * b
+    v = 0.615 * r - 0.515 * g - 0.100 * b
 
-    return (
-        yuvimage[..., :1, :, :],
-        yuvimage[..., 1:3, :, :].unfold(-2, 2, 2).unfold(-2, 2, 2).mean((-1, -2)),
+    # Y channel as shape (*, 1, H, W)
+    y = y.unsqueeze(-3)
+
+    # Downsample U and V together for UV420
+    # Shape is (*, H, W)
+    # We stack so shape becomes (*, 2, H, W)
+    uv = (
+        # Stack U and V as channels, shape becomes (*, 2, H, W)
+        # Then downsample spatial (average 2x2 blocks), resulting in (*, 2, H/2, W/2)
+        # Do it without extra copying via efficient view/reshape
+        # This is much faster than unfold+mean
+        # Reshape to even 2x2 blocks and average
+        # Assure H and W are even
+        # Permute to (..., C, H, W) (already like that), then:
+        # split H and W into (H//2, 2) and (W//2, 2) and mean over the small blocks
+        # torch.stack([u, v], dim=-3): shape (..., 2, H, W)
+        torch.stack((u, v), dim=-3).reshape(*u.shape[:-2], 2, y.shape[-2] // 2, 2, y.shape[-1] // 2, 2).mean((-1, -3))
     )
+    return y, uv
 
 
 def rgb_to_yuv422(image: Tensor) -> tuple[Tensor, Tensor]:
