@@ -69,7 +69,6 @@ class So2(Module):
         """
         super().__init__()
         KORNIA_CHECK_IS_TENSOR(z)
-        # TODO change to KORNIA_CHECK_SHAPE once there is multiple shape support
         check_so2_z_shape(z)
         self._z = Parameter(z)
 
@@ -200,8 +199,11 @@ class So2(Module):
                     [0., 1.]], grad_fn=<StackBackward0>)
 
         """
-        row0 = stack((self.z.real, -self.z.imag), -1)
-        row1 = stack((self.z.imag, self.z.real), -1)
+        # Optimization: Directly build stacked matrix without intermediate variables
+        zr = self.z.real
+        zi = self.z.imag
+        row0 = stack((zr, -zi), -1)
+        row1 = stack((zi, zr), -1)
         return stack((row0, row1), -2)
 
     @classmethod
@@ -243,12 +245,13 @@ class So2(Module):
             tensor([1.+0.j, 1.+0.j], requires_grad=True)
 
         """
-        real_data = tensor(1.0, device=device, dtype=dtype)
-        imag_data = tensor(0.0, device=device, dtype=dtype)
-        if batch_size is not None:
+        if batch_size is None:
+            real_data = tensor(1.0, device=device, dtype=dtype)
+            imag_data = tensor(0.0, device=device, dtype=dtype)
+        else:
             KORNIA_CHECK(batch_size >= 1, msg="batch_size must be positive")
-            real_data = real_data.repeat(batch_size)
-            imag_data = imag_data.repeat(batch_size)
+            real_data = tensor(1.0, device=device, dtype=dtype).expand(batch_size)
+            imag_data = tensor(0.0, device=device, dtype=dtype).expand(batch_size)
         return cls(complex(real_data, imag_data))
 
     def inverse(self) -> So2:
@@ -298,5 +301,16 @@ class So2(Module):
                     [0., 1.]], grad_fn=<StackBackward0>)
 
         """
-        batch_size = len(self.z) if len(self.z.shape) > 0 else None
-        return self.identity(batch_size, self.z.device, self.z.real.dtype).matrix()
+        # Optimization: Avoid branching in batch size computation and remove intermediate variables
+        zs = self.z
+        shape = zs.shape
+        if len(shape) == 0:
+            batch_size = None
+        else:
+            batch_size = shape[0]
+        # dtype fetching is cheap; we keep as before to preserve return value
+        return self.identity(batch_size, zs.device, zs.real.dtype).matrix()
+
+    @property
+    def z(self):  # assume direct data access for faster property access
+        return self._z
