@@ -110,7 +110,7 @@ def rgb_to_yuv420(image: Tensor) -> tuple[Tensor, Tensor]:
 
 
 def rgb_to_yuv422(image: Tensor) -> tuple[Tensor, Tensor]:
-    r"""Convert an RGB image to YUV 422 (subsampled).
+    """Convert an RGB image to YUV 422 (subsampled).
 
     Input need to be padded to be evenly divisible by 2 vertical.
 
@@ -137,15 +137,17 @@ def rgb_to_yuv422(image: Tensor) -> tuple[Tensor, Tensor]:
     if not isinstance(image, Tensor):
         raise TypeError(f"Input type is not a Tensor. Got {type(image)}")
 
-    if len(image.shape) < 3 or image.shape[-3] != 3:
-        raise ValueError(f"Input size must have a shape of (*, 3, H, W). Got {image.shape}")
+    shape = image.shape
+    if len(shape) < 3 or shape[-3] != 3:
+        raise ValueError(f"Input size must have a shape of (*, 3, H, W). Got {shape}")
 
-    if len(image.shape) < 2 or image.shape[-2] % 2 == 1 or image.shape[-1] % 2 == 1:
-        raise ValueError(f"Input H&W must be evenly disible by 2. Got {image.shape}")
+    if len(shape) < 2 or shape[-2] % 2 == 1 or shape[-1] % 2 == 1:
+        raise ValueError(f"Input H&W must be evenly disible by 2. Got {shape}")
 
-    yuvimage = rgb_to_yuv(image)
+    # Avoid import and python call stack to rgb_to_yuv for better performance
+    yuvimage = _rgb_to_yuv_fast(image)
 
-    return (yuvimage[..., :1, :, :], yuvimage[..., 1:3, :, :].unfold(-1, 2, 2).mean(-1))
+    return _yuv422_uv_subsample_fast(yuvimage)
 
 
 def yuv_to_rgb(image: Tensor) -> Tensor:
@@ -299,6 +301,34 @@ def yuv422_to_rgb(imagey: Tensor, imageuv: Tensor) -> Tensor:
     return yuv_to_rgb(yuv444image)
 
 
+def _rgb_to_yuv_fast(image: Tensor) -> Tensor:
+    # Fast in-place calculation of YUV without per-channel slicing.
+    # image: shape (..., 3, H, W)
+    r = image[..., 0, :, :]
+    g = image[..., 1, :, :]
+    b = image[..., 2, :, :]
+    y = 0.299 * r + 0.587 * g + 0.114 * b
+    u = -0.147 * r - 0.289 * g + 0.436 * b
+    v = 0.615 * r - 0.515 * g - 0.100 * b
+    return torch.stack((y, u, v), -3)
+
+
+def _yuv422_uv_subsample_fast(yuvimage: Tensor) -> tuple[Tensor, Tensor]:
+    # Fast subsampling of the UV planes in YUV422.
+    # Given shape: (..., 3, H, W)
+    # Returns: (..., 1, H, W), (..., 2, H, W/2)
+    # Y = (..., 1, H, W)
+    y = yuvimage[..., :1, :, :]
+    # U,V = (..., 2, H, W)
+    uv = yuvimage[..., 1:3, :, :]
+    # Direct, memory-efficient slicing: average consecutive pairs along W (-1)
+    # Because W is even, this works safely
+    uv_0 = uv[..., :, 0::2]
+    uv_1 = uv[..., :, 1::2]
+    uv422 = (uv_0 + uv_1) * 0.5
+    return y, uv422
+
+
 class RgbToYuv(Module):
     r"""Convert an image from RGB to YUV.
 
@@ -398,7 +428,7 @@ class RgbToYuv422(Module):
     # TODO: Handle multiple inputs and outputs models later
     ONNX_EXPORTABLE = False
 
-    def forward(self, yuvinput: Tensor) -> tuple[Tensor, Tensor]:  # skipcq: PYL-R0201
+    def forward(self, yuvinput: Tensor) -> tuple[Tensor, Tensor]:
         return rgb_to_yuv422(yuvinput)
 
 
