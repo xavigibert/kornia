@@ -15,6 +15,7 @@
 # limitations under the License.
 #
 
+from functools import lru_cache
 from typing import Callable, Dict, List, Optional, Type
 
 import torch
@@ -38,6 +39,11 @@ def conv1x1(in_planes: int, out_planes: int, stride: int = 1) -> nn.Conv2d:
 
 def conv3x3(in_planes: int, out_planes: int, stride: int = 1, groups: int = 1, dilation: int = 1) -> nn.Conv2d:
     """3x3 convolution with padding."""
+    return _conv3x3_cached(in_planes, out_planes, stride, groups, dilation)
+
+
+@lru_cache(maxsize=32)
+def _conv3x3_cached(in_planes: int, out_planes: int, stride: int, groups: int, dilation: int) -> nn.Conv2d:
     return nn.Conv2d(
         in_planes,
         out_planes,
