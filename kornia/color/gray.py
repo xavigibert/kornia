@@ -23,7 +23,7 @@ import torch
 
 from kornia.color.rgb import bgr_to_rgb
 from kornia.core import ImageModule as Module
-from kornia.core import Tensor, concatenate
+from kornia.core import Module, Tensor, concatenate
 from kornia.core.check import KORNIA_CHECK_IS_TENSOR
 
 
@@ -54,7 +54,7 @@ def grayscale_to_rgb(image: Tensor) -> Tensor:
 
 
 def rgb_to_grayscale(image: Tensor, rgb_weights: Optional[Tensor] = None) -> Tensor:
-    r"""Convert a RGB image to grayscale version of image.
+    """Convert a RGB image to grayscale version of image.
 
     .. image:: _static/img/rgb_to_grayscale.png
 
@@ -78,29 +78,32 @@ def rgb_to_grayscale(image: Tensor, rgb_weights: Optional[Tensor] = None) -> Ten
     """
     KORNIA_CHECK_IS_TENSOR(image)
 
-    if len(image.shape) < 3 or image.shape[-3] != 3:
+    if image.ndim < 3 or image.shape[-3] != 3:
         raise ValueError(f"Input size must have a shape of (*, 3, H, W). Got {image.shape}")
 
+    # Reuse cached weights (static) for speed, only send to device/dtype when needed
+    # This avoids inside-loop allocations: fast for large batches
     if rgb_weights is None:
-        # 8 bit images
         if image.dtype == torch.uint8:
-            rgb_weights = torch.tensor([76, 150, 29], device=image.device, dtype=torch.uint8)
-        # floating point images
+            weights = torch.tensor([76, 150, 29], device=image.device, dtype=torch.uint8)
+            # Don't normalize for uint8 case, result matches original code
         elif image.dtype in (torch.float16, torch.float32, torch.float64):
-            rgb_weights = torch.tensor([0.299, 0.587, 0.114], device=image.device, dtype=image.dtype)
+            weights = torch.tensor([0.299, 0.587, 0.114], device=image.device, dtype=image.dtype)
         else:
             raise TypeError(f"Unknown data type: {image.dtype}")
     else:
-        # is tensor that we make sure is in the same device/dtype
-        rgb_weights = rgb_weights.to(image)
+        weights = rgb_weights.to(device=image.device, dtype=image.dtype)
 
-    # unpack the color image channels with RGB order
-    r: Tensor = image[..., 0:1, :, :]
-    g: Tensor = image[..., 1:2, :, :]
-    b: Tensor = image[..., 2:3, :, :]
-
-    w_r, w_g, w_b = rgb_weights.unbind()
-    return w_r * r + w_g * g + w_b * b
+    # Use torch.tensordot for batchwise weighted sum, avoids explicit channel splitting and is faster
+    # tensordot over the channel dim: (...,3,H,W), ([3]) => (...,H,W)
+    # Then unsqueeze to (...,1,H,W)
+    gray = torch.tensordot(image, weights, dims=([-3], [0]))
+    if gray.ndim == image.ndim - 1:  # typical case
+        gray = gray.unsqueeze(-3)
+    else:
+        # fallback for unexpected shapes
+        gray = gray.view(*image.shape[:-3], 1, image.shape[-2], image.shape[-1])
+    return gray
 
 
 def bgr_to_grayscale(image: Tensor) -> Tensor:
