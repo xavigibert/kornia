@@ -24,13 +24,13 @@ from kornia.core.check import KORNIA_CHECK, KORNIA_CHECK_IS_TENSOR, KORNIA_CHECK
 
 
 def charbonnier_loss(img1: Tensor, img2: Tensor, reduction: str = "none") -> Tensor:
-    r"""Criterion that computes the Charbonnier [2] (aka. L1-L2 [3]) loss.
+    """Criterion that computes the Charbonnier [2] (aka. L1-L2 [3]) loss.
 
     According to [1], we compute the Charbonnier loss as follows:
 
     .. math::
 
-        \text{WL}(x, y) = \sqrt{(x - y)^{2} + 1} - 1
+        \text{WL}(x, y) = \\sqrt{(x - y)^{2} + 1} - 1
 
     Where:
        - :math:`x` is the prediction.
@@ -65,32 +65,32 @@ def charbonnier_loss(img1: Tensor, img2: Tensor, reduction: str = "none") -> Ten
         >>> output.backward()
 
     """
+    # Group input validation to a single function call
+    _validate_charbonnier_inputs(img1, img2, reduction)
+
+    # In-place operation for the difference (saves memory and possibly speed)
+    diff = img1 - img2
+    diff_sq = diff.mul_(diff).add_(1.0)
+    loss = diff_sq.sqrt_().add_(-1.0)
+
+    # More efficient reduction check and execution
+    if reduction == "mean":
+        return loss.mean()
+    elif reduction == "sum":
+        return loss.sum()
+    # Handle None or "none" without extra checks
+    return loss
+
+
+def _validate_charbonnier_inputs(img1: Tensor, img2: Tensor, reduction: str) -> None:
+    """Optimized checks for inputs, grouped for fewer function calls in main function."""
     KORNIA_CHECK_IS_TENSOR(img1)
-
     KORNIA_CHECK_IS_TENSOR(img2)
-
     KORNIA_CHECK_SAME_SHAPE(img1, img2)
-
     KORNIA_CHECK_SAME_DEVICE(img1, img2)
-
     KORNIA_CHECK(
         reduction in ("mean", "sum", "none", None), f"Given type of reduction is not supported. Got: {reduction}"
     )
-
-    # compute loss
-    loss = ((img1 - img2) ** 2 + 1.0).sqrt() - 1.0
-
-    # perform reduction
-    if reduction == "mean":
-        loss = loss.mean()
-    elif reduction == "sum":
-        loss = loss.sum()
-    elif reduction == "none" or reduction is None:
-        pass
-    else:
-        raise NotImplementedError("Invalid reduction option.")
-
-    return loss
 
 
 class CharbonnierLoss(Module):
