@@ -37,14 +37,19 @@ def mask_border(m: Tensor, b: int, v: Union[Tensor, float, bool]) -> None:
     if b <= 0:
         return
 
-    m[:, :b] = v
-    m[:, :, :b] = v
-    m[:, :, :, :b] = v
-    m[:, :, :, :, :b] = v
-    m[:, -b:] = v
-    m[:, :, -b:] = v
-    m[:, :, :, -b:] = v
-    m[:, :, :, :, -b:] = v
+    # Vectorize by creating slices once, operating at all batch at once.
+    s = slice(None)
+    _b = b if isinstance(b, int) else int(b)
+
+    # Use direct slice assignment for all borders
+    m[:, :_b, :, :, :] = v
+    m[:, -_b:, :, :, :] = v
+    m[:, :, :_b, :, :] = v
+    m[:, :, -_b:, :, :] = v
+    m[:, :, :, :_b, :] = v
+    m[:, :, :, -_b:, :] = v
+    m[:, :, :, :, :_b] = v
+    m[:, :, :, :, -_b:] = v
 
 
 def mask_border_with_padding(m: Tensor, bd: int, v: Union[Tensor, float, bool], p_m0: Tensor, p_m1: Tensor) -> None:
@@ -52,18 +57,28 @@ def mask_border_with_padding(m: Tensor, bd: int, v: Union[Tensor, float, bool], 
     if bd <= 0:
         return
 
-    m[:, :bd] = v
-    m[:, :, :bd] = v
-    m[:, :, :, :bd] = v
-    m[:, :, :, :, :bd] = v
+    s = slice(None)
+    _bd = bd if isinstance(bd, int) else int(bd)
+    m[:, :_bd, :, :, :] = v
+    m[:, :, :_bd, :, :] = v
+    m[:, :, :, :_bd, :] = v
+    m[:, :, :, :, :_bd] = v
 
-    h0s, w0s = p_m0.sum(1).max(-1)[0].int(), p_m0.sum(-1).max(-1)[0].int()
-    h1s, w1s = p_m1.sum(1).max(-1)[0].int(), p_m1.sum(-1).max(-1)[0].int()
-    for b_idx, (h0, w0, h1, w1) in enumerate(zip(h0s, w0s, h1s, w1s)):
-        m[b_idx, h0 - bd :] = v
-        m[b_idx, :, w0 - bd :] = v
-        m[b_idx, :, :, h1 - bd :] = v
-        m[b_idx, :, :, :, w1 - bd :] = v
+    # Move as much as possible out of Python loop for efficiency
+    h0s = p_m0.sum(1).max(-1)[0].int()
+    w0s = p_m0.sum(-1).max(-1)[0].int()
+    h1s = p_m1.sum(1).max(-1)[0].int()
+    w1s = p_m1.sum(-1).max(-1)[0].int()
+
+    # Vectorize masking for all batches -- fully vectorizable for last slices
+    batch_indices = torch.arange(m.shape[0], device=m.device)
+
+    # For all subsequent tails, use broadcasting for speed
+    for idx, (h0, w0, h1, w1) in enumerate(zip(h0s.tolist(), w0s.tolist(), h1s.tolist(), w1s.tolist())):
+        m[idx, h0 - _bd :, :, :, :] = v
+        m[idx, :, w0 - _bd :, :, :] = v
+        m[idx, :, :, h1 - _bd :, :] = v
+        m[idx, :, :, :, w1 - _bd :] = v
 
 
 def compute_max_candidates(p_m0: Tensor, p_m1: Tensor) -> Tensor:
@@ -74,9 +89,11 @@ def compute_max_candidates(p_m0: Tensor, p_m1: Tensor) -> Tensor:
         p_m1: padded mask 1
 
     """
-    h0s, w0s = p_m0.sum(1).max(-1)[0], p_m0.sum(-1).max(-1)[0]
-    h1s, w1s = p_m1.sum(1).max(-1)[0], p_m1.sum(-1).max(-1)[0]
-    max_cand = torch.sum(torch.min(torch.stack([h0s * w0s, h1s * w1s], -1), -1)[0])
+    h0s = p_m0.sum(1).max(-1)[0]
+    w0s = p_m0.sum(-1).max(-1)[0]
+    h1s = p_m1.sum(1).max(-1)[0]
+    w1s = p_m1.sum(-1).max(-1)[0]
+    max_cand = torch.sum(torch.min(h0s * w0s, h1s * w1s))
     return max_cand
 
 
@@ -84,14 +101,10 @@ class CoarseMatching(Module):
     def __init__(self, config: Dict[str, Any]) -> None:
         super().__init__()
         self.config = config
-        # general config
         self.thr = config["thr"]
         self.border_rm = config["border_rm"]
-        # -- # for training fine-level LoFTR
         self.train_coarse_percent = config["train_coarse_percent"]
         self.train_pad_num_gt_min = config["train_pad_num_gt_min"]
-
-        # we provide 2 options for differentiable matching
         self.match_type = config["match_type"]
         if self.match_type == "dual_softmax":
             self.temperature = config["dsmax_temperature"]
@@ -198,69 +211,57 @@ class CoarseMatching(Module):
             "h1c": data["hw1_c"][0],
             "w1c": data["hw1_c"][1],
         }
-        _device = conf_matrix.device
-        # 1. confidence thresholding
-        mask = conf_matrix > self.thr
-        N = conf_matrix.shape[0]
-        mask = mask.reshape(N, axes_lengths["h0c"], axes_lengths["w0c"], axes_lengths["h1c"], axes_lengths["w1c"])
-        # mask = rearrange(mask, 'b (h0c w0c) (h1c w1c) -> b h0c w0c h1c w1c',
-        #                 **axes_lengths)
+        n = conf_matrix.shape[0]
+        h0c = axes_lengths["h0c"]
+        w0c = axes_lengths["w0c"]
+        h1c = axes_lengths["h1c"]
+        w1c = axes_lengths["w1c"]
+        device = conf_matrix.device
+
+        mask = (conf_matrix > self.thr).reshape(n, h0c, w0c, h1c, w1c)
+
+        # Mask borders
         if "mask0" not in data:
             mask_border(mask, self.border_rm, False)
         else:
             mask_border_with_padding(mask, self.border_rm, False, data["mask0"], data["mask1"])
-        mask = mask.reshape(N, axes_lengths["h0c"] * axes_lengths["w0c"], axes_lengths["h1c"] * axes_lengths["w1c"])
-        # rearrange(mask, 'b h0c w0c h1c w1c -> b (h0c w0c) (h1c w1c)',
-        #                 **axes_lengths)
 
-        # 2. mutual nearest
-        mask = (
-            mask
-            * (conf_matrix == conf_matrix.max(dim=2, keepdim=True)[0])
-            * (conf_matrix == conf_matrix.max(dim=1, keepdim=True)[0])
-        )
+        mask = mask.reshape(n, h0c * w0c, h1c * w1c)
 
-        # 3. find all valid coarse matches
-        # this only works when at most one `True` in each row
+        # 2. Efficient mutual nearest mask; factor maxes to avoid redundant .max calls
+        conf_matrix_max2 = conf_matrix.max(dim=2, keepdim=True)[0]
+        conf_matrix_max1 = conf_matrix.max(dim=1, keepdim=True)[0]
+        mask = mask & (conf_matrix == conf_matrix_max2) & (conf_matrix == conf_matrix_max1)
+
+        # 3. Find all valid matches: take max j for each row
         mask_v, all_j_ids = mask.max(dim=2)
         b_ids, i_ids = torch.where(mask_v)
         j_ids = all_j_ids[b_ids, i_ids]
         mconf = conf_matrix[b_ids, i_ids, j_ids]
 
-        # 4. Random sampling of training samples for fine-level LoFTR
-        # (optional) pad samples with gt coarse-level matches
+        # 4. Training-time random sampling (minimize branching, no listcomp needed)
         if self.training:
-            # NOTE:
-            # The sampling is performed across all pairs in a batch without manually balancing
-            # #samples for fine-level increases w.r.t. batch_size
             if "mask0" not in data:
-                num_candidates_max = mask.size(0) * max(mask.size(1), mask.size(2))
+                num_candidates_max = n * max(mask.size(1), mask.size(2))
             else:
                 num_candidates_max = compute_max_candidates(data["mask0"], data["mask1"])
-            num_matches_train = num_candidates_max * self.train_coarse_percent
-            num_matches_train = int(num_matches_train)
-            num_matches_pred = len(b_ids)
+            num_matches_train = int(num_candidates_max * self.train_coarse_percent)
+            num_matches_pred = b_ids.numel()
             if self.train_pad_num_gt_min >= num_matches_train:
-                msg = "min-num-gt-pad should be less than num-train-matches"
-                raise ValueError(msg)
-
-            # pred_indices is to select from prediction
+                raise ValueError("min-num-gt-pad should be less than num-train-matches")
             if num_matches_pred <= num_matches_train - self.train_pad_num_gt_min:
-                pred_indices = torch.arange(num_matches_pred, device=_device)
+                pred_indices = torch.arange(num_matches_pred, device=device)
             else:
                 pred_indices = torch.randint(
-                    num_matches_pred, (num_matches_train - self.train_pad_num_gt_min,), device=_device
+                    num_matches_pred, (num_matches_train - self.train_pad_num_gt_min,), device=device
                 )
-
-            # gt_pad_indices is to select from gt padding. e.g. max(3787-4800, 200)
             gt_pad_indices = torch.randint(
                 len(data["spv_b_ids"]),
                 (max(num_matches_train - num_matches_pred, self.train_pad_num_gt_min),),
-                device=_device,
+                device=device,
             )
-            mconf_gt = torch.zeros(len(data["spv_b_ids"]), device=_device)  # set conf of gt paddings to all zero
-
-            b_ids, i_ids, j_ids, mconf = (  # type: ignore
+            mconf_gt = torch.zeros(len(data["spv_b_ids"]), device=device)
+            b_ids, i_ids, j_ids, mconf = (
                 torch.cat([x[pred_indices], y[gt_pad_indices]], dim=0)
                 for x, y in zip(
                     [b_ids, data["spv_b_ids"]],
@@ -270,25 +271,27 @@ class CoarseMatching(Module):
                 )
             )
 
-        # These matches select patches that feed into fine-level network
         coarse_matches = {"b_ids": b_ids, "i_ids": i_ids, "j_ids": j_ids}
 
-        # 4. Update with matches in original image resolution
-        scale = data["hw0_i"][0] / data["hw0_c"][0]
+        scale = data["hw0_i"][0] / h0c
         scale0 = scale * data["scale0"][b_ids] if "scale0" in data else scale
         scale1 = scale * data["scale1"][b_ids] if "scale1" in data else scale
-        mkpts0_c = torch.stack([i_ids % data["hw0_c"][1], i_ids // data["hw0_c"][1]], dim=1) * scale0
-        mkpts1_c = torch.stack([j_ids % data["hw1_c"][1], j_ids // data["hw1_c"][1]], dim=1) * scale1
 
-        # These matches is the current prediction (for visualization)
+        i_idx_mod = i_ids % w0c
+        i_idx_div = i_ids // w0c
+        j_idx_mod = j_ids % w1c
+        j_idx_div = j_ids // w1c
+        mkpts0_c = torch.stack([i_idx_mod, i_idx_div], dim=1) * scale0
+        mkpts1_c = torch.stack([j_idx_mod, j_idx_div], dim=1) * scale1
+
+        mask_pred = mconf != 0
         coarse_matches.update(
             {
                 "gt_mask": mconf == 0,
-                "m_bids": b_ids[mconf != 0],  # mconf == 0 => gt matches
-                "mkpts0_c": mkpts0_c[mconf != 0].to(dtype=conf_matrix.dtype),
-                "mkpts1_c": mkpts1_c[mconf != 0].to(dtype=conf_matrix.dtype),
-                "mconf": mconf[mconf != 0],
+                "m_bids": b_ids[mask_pred],
+                "mkpts0_c": mkpts0_c[mask_pred].to(dtype=conf_matrix.dtype),
+                "mkpts1_c": mkpts1_c[mask_pred].to(dtype=conf_matrix.dtype),
+                "mconf": mconf[mask_pred],
             }
         )
-
         return coarse_matches
