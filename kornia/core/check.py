@@ -458,9 +458,12 @@ def KORNIA_CHECK_LAF(laf: Tensor, raises: bool = True) -> bool:
 
 def _handle_invalid_range(msg: Optional[str], raises: bool, min_val: float | Tensor, max_val: float | Tensor) -> bool:
     """Helper function to handle invalid range cases."""
-    err_msg = f"Invalid image value range. Expect [0, 1] but got [{min_val}, {max_val}]."
-    if msg is not None:
-        err_msg += f"\n{msg}"
-    if raises:
-        raise ValueError(err_msg)
-    return False
+    # Fast implementation: reduce string concatenations, branch less
+    if msg is None:
+        if raises:
+            raise ValueError(f"Invalid image value range. Expect [0, 1] but got [{min_val}, {max_val}].")
+        return False
+    else:
+        if raises:
+            raise ValueError(f"Invalid image value range. Expect [0, 1] but got [{min_val}, {max_val}].\n{msg}")
+        return False
