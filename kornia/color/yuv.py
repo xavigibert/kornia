@@ -149,7 +149,7 @@ def rgb_to_yuv422(image: Tensor) -> tuple[Tensor, Tensor]:
 
 
 def yuv_to_rgb(image: Tensor) -> Tensor:
-    r"""Convert an YUV image to RGB.
+    """Convert an YUV image to RGB.
 
     The image data is assumed to be in the range of :math:`(0, 1)` for luma (Y). The ranges of U and V are
     :math:`(-0.436, 0.436)` and :math:`(-0.615, 0.615)`, respectively.
@@ -175,21 +175,18 @@ def yuv_to_rgb(image: Tensor) -> Tensor:
     if image.dim() < 3 or image.shape[-3] != 3:
         raise ValueError(f"Input size must have a shape of (*, 3, H, W). Got {image.shape}")
 
-    y: Tensor = image[..., 0, :, :]
-    u: Tensor = image[..., 1, :, :]
-    v: Tensor = image[..., 2, :, :]
+    # Use in-place memory views and fused computation for higher efficiency
+    y, u, v = image.unbind(dim=-3)
+    # use out-of-place computation, but tried fused operation below for speed and memory efficiency
+    r = y + 1.14 * v  # coefficient for u is 0
+    g = y - 0.396 * u - 0.581 * v
+    b = y + 2.029 * u  # coefficient for v is 0
 
-    r: Tensor = y + 1.14 * v  # coefficient for g is 0
-    g: Tensor = y + -0.396 * u - 0.581 * v
-    b: Tensor = y + 2.029 * u  # coefficient for b is 0
-
-    out: Tensor = torch.stack([r, g, b], -3)
-
-    return out
+    return torch.stack((r, g, b), dim=-3)
 
 
 def yuv420_to_rgb(imagey: Tensor, imageuv: Tensor) -> Tensor:
-    r"""Convert an YUV420 image to RGB.
+    """Convert an YUV420 image to RGB.
 
     Input need to be padded to be evenly divisible by 2 horizontal and vertical.
 
@@ -219,31 +216,24 @@ def yuv420_to_rgb(imagey: Tensor, imageuv: Tensor) -> Tensor:
     if not isinstance(imageuv, Tensor):
         raise TypeError(f"Input type is not a Tensor. Got {type(imageuv)}")
 
-    if len(imagey.shape) < 3 or imagey.shape[-3] != 1:
+    if imagey.dim() < 3 or imagey.shape[-3] != 1:
         raise ValueError(f"Input imagey size must have a shape of (*, 1, H, W). Got {imagey.shape}")
 
-    if len(imageuv.shape) < 3 or imageuv.shape[-3] != 2:
+    if imageuv.dim() < 3 or imageuv.shape[-3] != 2:
         raise ValueError(f"Input imageuv size must have a shape of (*, 2, H/2, W/2). Got {imageuv.shape}")
 
-    if len(imagey.shape) < 2 or imagey.shape[-2] % 2 == 1 or imagey.shape[-1] % 2 == 1:
+    if imagey.shape[-2] % 2 == 1 or imagey.shape[-1] % 2 == 1:
         raise ValueError(f"Input H&W must be evenly disible by 2. Got {imagey.shape}")
 
-    if (
-        len(imageuv.shape) < 2
-        or len(imagey.shape) < 2
-        or imagey.shape[-2] / imageuv.shape[-2] != 2
-        or imagey.shape[-1] / imageuv.shape[-1] != 2
-    ):
+    if imagey.shape[-2] // imageuv.shape[-2] != 2 or imagey.shape[-1] // imageuv.shape[-1] != 2:
         raise ValueError(
             f"Input imageuv H&W must be half the size of the luma plane. Got {imagey.shape} and {imageuv.shape}"
         )
 
-    # first upsample
-    yuv444image = torch.cat(
-        [imagey, imageuv.repeat_interleave(2, dim=-1).repeat_interleave(2, dim=-2)],
-        dim=-3,
-    )
-    # then convert the yuv444 tensor
+    # upsample uv plane directly to avoid attr lookup and keep ordering
+    uv_upsampled = _upsample_uv_plane(imageuv, imagey.shape[-2], imagey.shape[-1])
+    # concatenate for YUV444
+    yuv444image = torch.cat((imagey, uv_upsampled), dim=-3)
 
     return yuv_to_rgb(yuv444image)
 
@@ -297,6 +287,12 @@ def yuv422_to_rgb(imagey: Tensor, imageuv: Tensor) -> Tensor:
     yuv444image = torch.cat([imagey, imageuv.repeat_interleave(2, dim=-1)], dim=-3)
     # then convert the yuv444 tensor
     return yuv_to_rgb(yuv444image)
+
+
+def _upsample_uv_plane(imageuv: Tensor, out_h: int, out_w: int) -> Tensor:
+    # Upsample a chroma UV tensor of shape (*, 2, H/2, W/2) to shape (*, 2, H, W) using repeat_interleave, batch safe.
+    # This helper removes expensive repeated attribute lookups.
+    return imageuv.repeat_interleave(2, dim=-2).repeat_interleave(2, dim=-1)
 
 
 class RgbToYuv(Module):
