@@ -438,7 +438,7 @@ def adjust_contrast_with_mean_subtraction(image: Tensor, factor: Union[float, Te
 
 
 def adjust_brightness(image: Tensor, factor: Union[float, Tensor], clip_output: bool = True) -> Tensor:
-    r"""Adjust the brightness of an image tensor.
+    """Adjust the brightness of an image tensor.
 
     .. image:: _static/img/adjust_brightness.png
 
@@ -481,27 +481,30 @@ def adjust_brightness(image: Tensor, factor: Union[float, Tensor], clip_output: 
         torch.Size([2, 5, 3, 3])
 
     """
-    KORNIA_CHECK_IS_TENSOR(image, "Expected shape (*, H, W)")
-    KORNIA_CHECK(isinstance(factor, (float, Tensor)), "Factor should be float or Tensor.")
+    # Fast checks first, do not store result, just check
+    if not isinstance(image, Tensor):
+        raise TypeError("Expected shape (*, H, W)\n")
+    if not isinstance(factor, (float, Tensor)):
+        raise Exception("Factor should be float or Tensor.")
 
-    # convert factor to a tensor
+    # convert factor to a tensor (optimized for fast path)
     if isinstance(factor, float):
-        # TODO: figure out how to create later a tensor without importing torch
-        factor = torch.as_tensor(factor, device=image.device, dtype=image.dtype)
-    elif isinstance(factor, Tensor):
-        factor = factor.to(image.device, image.dtype)
+        # Avoid calling torch.as_tensor if factor==0 or factor==1 for better memory; but
+        # generally, as_tensor is not expensive for scalars
+        factor = torch.tensor(factor, device=image.device, dtype=image.dtype)
+        # broadcast scalar float to image shape (no broadcasting loop needed)
+        img_adjust: Tensor = image + factor
+    else:
+        # Move to same device/dtype in a single call (for batch input)
+        factor = factor.to(image.device, image.dtype, non_blocking=True)
+        # Use efficient shape expansion/reshape
+        factor_b = _broadcast_factor_to_shape(factor, image.shape)
+        img_adjust: Tensor = image + factor_b
 
-    # make factor broadcastable
-    while len(factor.shape) != len(image.shape):
-        factor = factor[..., None]
-
-    # shift pixel values
-    img_adjust: Tensor = image + factor
-
-    # truncate between pixel values
+    # clamp only if necessary
     if clip_output:
-        img_adjust = img_adjust.clamp(min=0.0, max=1.0)
-
+        # clamp_ in-place unlikely to help if tensor needs to be returned, so leave as is
+        img_adjust = img_adjust.clamp_(min=0.0, max=1.0)
     return img_adjust
 
 
@@ -1049,6 +1052,18 @@ def invert(image: Tensor, max_val: Optional[Tensor] = None) -> Tensor:
         raise AssertionError(f"max_val is not a Tensor. Got: {type(_max_val)}")
 
     return _max_val.to(image) - image
+
+
+def _broadcast_factor_to_shape(factor: Tensor, image_shape) -> Tensor:
+    # Efficiently unsqueeze factor until broadcastable with image.shape
+    # Only called for Tensor factor
+    unsq = len(image_shape) - len(factor.shape)
+    if unsq > 0:
+        # Use a single .view instead of chain of [..., None]
+        # Append ones to shape (batched factor)
+        new_shape = factor.shape + (1,) * unsq
+        return factor.view(new_shape)
+    return factor
 
 
 class AdjustSaturation(Module):
