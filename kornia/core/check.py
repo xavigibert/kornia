@@ -365,9 +365,16 @@ def KORNIA_CHECK_IS_COLOR_OR_GRAY(x: Tensor, msg: Optional[str] = None, raises: 
         True
 
     """
-    if len(x.shape) < 3 or x.shape[-3] not in [1, 3]:
+    # Use locals for shape access for minor speedup, tuple comparison is faster than list inclusion
+    shape = x.shape
+    if len(shape) < 3 or (shape[-3] != 1 and shape[-3] != 3):
         if raises:
-            raise TypeError(f"Not a color or gray tensor. Got: {type(x)}.\n{msg}")
+            # Keep error message construction minimal unless needed
+            raise TypeError(
+                f"Not a color or gray tensor. Got: {type(x)}.\n{msg}"
+                if msg is not None
+                else f"Not a color or gray tensor. Got: {type(x)}."
+            )
         return False
     return True
 
