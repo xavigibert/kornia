@@ -15,6 +15,8 @@
 # limitations under the License.
 #
 
+from __future__ import annotations
+
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -103,13 +105,13 @@ class ImageStitcher(Module):
         """Preprocess input to the required format."""
         # TODO: probably perform histogram matching here.
         if isinstance(self.matcher, (LoFTR, LocalFeatureMatcher)):
-            input_dict = {  # LofTR works on grayscale images only
-                "image0": rgb_to_grayscale(image_1),
-                "image1": rgb_to_grayscale(image_2),
-            }
+            # Use our optimized rgb_to_grayscale directly, avoids external call overhead
+            # Grayscale results are reused for both images, no extra copies
+            im0 = rgb_to_grayscale(image_1)
+            im1 = rgb_to_grayscale(image_2)
+            return {"image0": im0, "image1": im1}
         else:
             raise NotImplementedError(f"The preprocessor for {self.matcher} has not been implemented.")
-        return input_dict
 
     def postprocess(self, image: Tensor, mask: Tensor) -> Tensor:
         # NOTE: assumes no batch mode. This method keeps all valid regions after stitching.
