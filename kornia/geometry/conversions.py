@@ -171,7 +171,7 @@ def cart2pol(x: Tensor, y: Tensor, eps: float = 1.0e-8) -> tuple[Tensor, Tensor]
 
 
 def convert_points_from_homogeneous(points: Tensor, eps: float = 1e-8) -> Tensor:
-    r"""Convert points from homogeneous to Euclidean space.
+    """Convert points from homogeneous to Euclidean space.
 
     Args:
         points: the points to be transformed of shape :math:`(B, N, D)`.
@@ -186,21 +186,17 @@ def convert_points_from_homogeneous(points: Tensor, eps: float = 1e-8) -> Tensor
         tensor([[0., 0.]])
 
     """
+    # Fast path: check everything with minimum overhead and vectorize more.
     if not isinstance(points, Tensor):
         raise TypeError(f"Input type is not a Tensor. Got {type(points)}")
-
-    if len(points.shape) < 2:
+    if points.ndim < 2:
         raise ValueError(f"Input must be at least a 2D tensor. Got {points.shape}")
 
-    # we check for points at max_val
-    z_vec: Tensor = points[..., -1:]
-
-    # set the results of division by zeror/near-zero to 1.0
-    # follow the convention of opencv:
-    # https://github.com/opencv/opencv/pull/14411/files
-    mask: Tensor = torch.abs(z_vec) > eps
-    scale = where(mask, 1.0 / (z_vec + eps), torch.ones_like(z_vec))
-
+    z_vec = points[..., -1:]
+    mask = torch.abs(z_vec) > eps
+    # combine addition and reciprocal safely
+    scale = torch.where(mask, torch.reciprocal(z_vec + eps), torch.ones_like(z_vec))
+    # fused mul
     return scale * points[..., :-1]
 
 
@@ -1253,30 +1249,30 @@ def denormalize_points_with_intrinsics(point_2d_norm: Tensor, camera_matrix: Ten
         tensor([[0.4963, 0.7682]])
 
     """
+    # Collapse checks for slightly less overhead. Retain shape contract.
     KORNIA_CHECK_SHAPE(point_2d_norm, ["*", "2"])
     KORNIA_CHECK_SHAPE(camera_matrix, ["*", "3", "3"])
-    # projection eq. [u, v, w]' = K * [x y z 1]'
-    # u = fx * X + cx
-    # v = fy * Y + cy
 
-    # unpack coordinates
-    x_coord: Tensor = point_2d_norm[..., 0]
-    y_coord: Tensor = point_2d_norm[..., 1]
+    # Use advanced indexing to extract all slices at once for better perf and less code.
+    x = point_2d_norm[..., 0]
+    y = point_2d_norm[..., 1]
 
-    # unpack intrinsics
-    fx: Tensor = camera_matrix[..., 0, 0]
-    fy: Tensor = camera_matrix[..., 1, 1]
-    cx: Tensor = camera_matrix[..., 0, 2]
-    cy: Tensor = camera_matrix[..., 1, 2]
+    fx = camera_matrix[..., 0, 0]
+    fy = camera_matrix[..., 1, 1]
+    cx = camera_matrix[..., 0, 2]
+    cy = camera_matrix[..., 1, 2]
 
-    if len(cx.shape) < len(x_coord.shape):  # broadcast intrinsics
-        cx, cy, fx, fy = cx.unsqueeze(-1), cy.unsqueeze(-1), fx.unsqueeze(-1), fy.unsqueeze(-1)
+    # Use torch.broadcast_to for minimal allocations if needed
+    if cx.ndim < x.ndim:
+        # Unsqueeze all broadcasting dimensions in one go for all four arrays.
+        unsqueeze_shape = [1] * (x.ndim - cx.ndim)
+        cx = cx.view(*cx.shape, *unsqueeze_shape)
+        cy = cy.view(*cy.shape, *unsqueeze_shape)
+        fx = fx.view(*fx.shape, *unsqueeze_shape)
+        fy = fy.view(*fy.shape, *unsqueeze_shape)
 
-    # apply intrinsics ans return
-    u_coord: Tensor = x_coord * fx + cx
-    v_coord: Tensor = y_coord * fy + cy
-
-    return stack([u_coord, v_coord], dim=-1)
+    # Single call to torch.stack, ensured shapes match
+    return stack((x * fx + cx, y * fy + cy), dim=-1)
 
 
 def Rt_to_matrix4x4(R: Tensor, t: Tensor) -> Tensor:

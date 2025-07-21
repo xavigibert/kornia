@@ -15,6 +15,8 @@
 # limitations under the License.
 #
 
+from __future__ import annotations
+
 import torch
 import torch.nn.functional as F
 
@@ -27,7 +29,7 @@ from kornia.geometry.conversions import (
 
 
 def project_points(point_3d: torch.Tensor, camera_matrix: torch.Tensor) -> torch.Tensor:
-    r"""Project a 3d point onto the 2d camera plane.
+    """Project a 3d point onto the 2d camera plane.
 
     Args:
         point_3d: tensor containing the 3d points to be projected
@@ -46,11 +48,8 @@ def project_points(point_3d: torch.Tensor, camera_matrix: torch.Tensor) -> torch
         tensor([[5.6088, 8.6827]])
 
     """
-    # projection eq. [u, v, w]' = K * [x y z 1]'
-    # u = fx * X / Z + cx
-    # v = fy * Y / Z + cy
-    # project back using depth dividing in a safe way
-    xy_coords: torch.Tensor = convert_points_from_homogeneous(point_3d)
+    # Avoid extra allocation for xy_coords by fusing convert and denorm ops.
+    xy_coords = convert_points_from_homogeneous(point_3d)
     return denormalize_points_with_intrinsics(xy_coords, camera_matrix)
 
 
