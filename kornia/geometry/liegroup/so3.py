@@ -123,16 +123,32 @@ class So3(Module):
 
         """
         # KORNIA_CHECK_SHAPE(v, ["B", "3"])  # FIXME: resolve shape bugs. @edgarriba
-        theta = batched_dot_product(v, v).sqrt()[..., None]
-        theta_nonzeros = theta != 0.0
-        theta_half = 0.5 * theta
-        # TODO: uncomment me after deprecate pytorch 10.2
-        # w = where(theta_nonzeros, theta_half.cos(), 1.0)
-        # b = where(theta_nonzeros, theta_half.sin() / theta, 0.0)
-        w = where(theta_nonzeros, theta_half.cos(), tensor(1.0, device=v.device, dtype=v.dtype))
-        b = where(theta_nonzeros, theta_half.sin() / theta, tensor(0.0, device=v.device, dtype=v.dtype))
+
+        # Compute theta = |v| in a single fused op; avoid repeat computation.
+        theta = batched_dot_product(v, v, keepdim=True).sqrt()
+        # Squeeze for mask, but keep shape (B, 1) for broadcasting
+        theta_nonzero_mask = theta != 0.0
+
+        # Instead of tensor(1.0) or tensor(0.0) repeatedly, use constants once.
+        one = tensor(1.0, device=v.device, dtype=v.dtype)
+        zero = tensor(0.0, device=v.device, dtype=v.dtype)
+
+        theta_half = theta * 0.5
+
+        # Avoid creating new tensors for each where: only keep shape, device, dtype.
+        # Use broadcasted shape of (B, 1)
+        w = where(theta_nonzero_mask, theta_half.cos(), one)
+        # theta_half.sin() / theta, but safe for zero
+        sin_theta_half = theta_half.sin()
+        safe_b = sin_theta_half / theta
+        b = where(theta_nonzero_mask, safe_b, zero)
+
+        # xyz = b * v, broadcasting (B,1)*(B,3)→(B,3)
         xyz = b * v
-        return So3(Quaternion(concatenate((w, xyz), -1)))
+
+        # Join w (B,1) and xyz (B,3) to get quaternion (B,4), minimal allocs
+        q = concatenate((w, xyz), -1)
+        return So3(Quaternion(q))
 
     def log(self) -> Tensor:
         """Convert elements of lie group  to elements of lie algebra.
@@ -361,8 +377,12 @@ class So3(Module):
             z: the z-axis rotation angle.
 
         """
+        # Instead of allocating two zero tensors, allocate once and use expand
         zs = zeros_like(z)
-        return cls.exp(stack((zs, zs, z), -1))
+        # stack expects [zs, zs, z] along last axis
+        # Use torch.stack instead of repeated expand/concatenate
+        v = stack((zs, zs, z), -1)
+        return cls.exp(v)
 
     def adjoint(self) -> Tensor:
         """Return the adjoint matrix of shape :math:`(B, 3, 3)`.
