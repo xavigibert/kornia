@@ -52,6 +52,13 @@ class BasicSequentialBase(nn.Sequential):
         super().__init__(_args)
         self._params: Optional[List[ParamItem]] = None
 
+        # Optimization: build fully-qualified name to submodule lookup (flat) for fast get_submodule.
+        # Only go one level deep since that's typical for Sequential, but
+        # handle nested modules for generic cases.
+        self._flat_submodule_dict: Dict[str, Module] = _build_name_to_module(self)
+        # Add self for '' key for the edge case of empty string as target.
+        self._flat_submodule_dict[""] = self
+
     def get_submodule(self, target: str) -> Module:
         """Get submodule.
 
@@ -73,22 +80,11 @@ class BasicSequentialBase(nn.Sequential):
                 ``Module``
 
         """
-        if len(target) == 0:
-            return self
-
-        atoms: List[str] = target.split(".")
-        mod = self
-
-        for item in atoms:
-            if not hasattr(mod, item):
-                raise AttributeError(mod._get_name() + " has no attribute `" + item + "`")
-
-            mod = getattr(mod, item)
-
-            if not isinstance(mod, Module):
-                raise AttributeError("`" + item + "` is not an Module")
-
-        return mod
+        # Use fast dict lookup, avoids split('.') and repeated getattr
+        try:
+            return self._flat_submodule_dict[target]
+        except KeyError:
+            raise AttributeError(self._get_name() + " has no attribute `" + target + "`")
 
     def clear_state(self) -> None:
         """Reset self._params state to None."""
@@ -231,9 +227,12 @@ class ImageSequentialBase(SequentialBase):
     def transform_masks(
         self, input: Tensor, params: List[ParamItem], extra_args: Optional[Dict[str, Any]] = None
     ) -> Tensor:
+        # Optimization: local lookup for self.get_submodule and MaskSequentialOps.transform
+        get_submodule = self.get_submodule
+        transform = MaskSequentialOps.transform
         for param in params:
-            module = self.get_submodule(param.name)
-            input = MaskSequentialOps.transform(input, module=module, param=param, extra_args=extra_args)
+            module = get_submodule(param.name)
+            input = transform(input, module=module, param=param, extra_args=extra_args)
         return input
 
     def inverse_masks(
@@ -362,3 +361,16 @@ class TransformMatrixMinIn:
     def _reset_transform_matrix_state(self) -> None:
         self._transform_matrix = None
         self._transform_matrices = []
+
+
+def _build_name_to_module(module: nn.Module, prefix: str = "") -> Dict[str, Module]:
+    # Helper: get a dict of all descendant submodules with 'parent.child.grandchild' names.
+    # Only builds for direct children of this sequential (not full trees).
+    result = {}
+    for name, sub in module._modules.items():
+        fqname = f"{prefix}{name}" if prefix == "" else f"{prefix}.{name}"
+        result[fqname] = sub
+        # Add recursive for nested submodules
+        if len(sub._modules) > 0:
+            result.update(_build_name_to_module(sub, fqname))
+    return result

@@ -19,6 +19,7 @@ import copy
 from abc import ABCMeta, abstractmethod
 from typing import Any, Callable, Dict, Generic, List, Optional, Type, TypeVar, Union
 
+from torch import nn
 from typing_extensions import ParamSpec
 
 import kornia.augmentation as K
@@ -197,6 +198,19 @@ def get_geometric_only_param(module: "K.container.ImageSequentialBase", param: L
         if isinstance(mod, (K.GeometricAugmentationBase2D, K.GeometricAugmentationBase3D)):
             res.append(p)
     return res
+
+
+def _build_name_to_module(module: nn.Module, prefix: str = "") -> Dict[str, Module]:
+    # Helper: get a dict of all descendant submodules with 'parent.child.grandchild' names.
+    # Only builds for direct children of this sequential (not full trees).
+    result = {}
+    for name, sub in module._modules.items():
+        fqname = f"{prefix}{name}" if prefix == "" else f"{prefix}.{name}"
+        result[fqname] = sub
+        # Add recursive for nested submodules
+        if len(sub._modules) > 0:
+            result.update(_build_name_to_module(sub, fqname))
+    return result
 
 
 class InputSequentialOps(SequentialOpsInterface[Tensor]):
