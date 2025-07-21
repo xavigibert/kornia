@@ -240,7 +240,14 @@ class HybridEncoder(Module):
         self.ccfm = CCFM(len(in_channels), hidden_dim, expansion)
 
     def forward(self, fmaps: list[Tensor]) -> list[Tensor]:
-        projected_maps = [proj(fmap) for proj, fmap in zip(self.input_proj, fmaps)]
-        projected_maps[-1] = self.encoder(projected_maps[-1])
+        # Optimized: Avoid list creation, project and immediately apply encoder to last fmap
+        projected_maps = []
+        input_proj = self.input_proj  # local var for speed
+        L = len(input_proj)
+        for i in range(L):
+            fmap = input_proj[i](fmaps[i])
+            if i == L - 1:
+                fmap = self.encoder(fmap)
+            projected_maps.append(fmap)
         new_fmaps = self.ccfm(projected_maps)
         return new_fmaps
