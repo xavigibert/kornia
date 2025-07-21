@@ -90,7 +90,13 @@ class CSPRepLayer(Module):
         )
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.conv3(self.bottlenecks(self.conv1(x)) + self.conv2(x))
+        # Optimize: avoid extra temporaries and minimize memory use by computing inplace (where possible)
+        # and avoid repeated allocations.
+        y1 = self.conv1(x)
+        y1 = self.bottlenecks(y1)
+        y2 = self.conv2(x)
+        y1 += y2  # In-place addition to save memory
+        return self.conv3(y1)
 
 
 # almost identical to nn.TransformerEncoderLayer
