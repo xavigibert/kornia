@@ -506,7 +506,7 @@ def adjust_brightness(image: Tensor, factor: Union[float, Tensor], clip_output: 
 
 
 def adjust_brightness_accumulative(image: Tensor, factor: Union[float, Tensor], clip_output: bool = True) -> Tensor:
-    r"""Adjust the brightness accumulatively of an image tensor.
+    """Adjust the brightness accumulatively of an image tensor.
 
     This implementation follows PIL convention.
 
@@ -537,24 +537,19 @@ def adjust_brightness_accumulative(image: Tensor, factor: Union[float, Tensor], 
     KORNIA_CHECK_IS_TENSOR(image, "Expected shape (*, H, W)")
     KORNIA_CHECK(isinstance(factor, (float, Tensor)), "Factor should be float or Tensor.")
 
-    # convert factor to a tensor
+    # Convert factor to tensor on image's device and dtype, only if necessary.
     if isinstance(factor, float):
-        # TODO: figure out how to create later a tensor without importing torch
-        factor = torch.as_tensor(factor, device=image.device, dtype=image.dtype)
+        factor = torch.tensor(factor, device=image.device, dtype=image.dtype)
     elif isinstance(factor, Tensor):
-        factor = factor.to(image.device, image.dtype)
+        if factor.device != image.device or factor.dtype != image.dtype:
+            factor = factor.to(device=image.device, dtype=image.dtype)
 
-    # make factor broadcastable
-    while len(factor.shape) != len(image.shape):
-        factor = factor[..., None]
+    # Efficiently make factor broadcastable to image
+    factor = _adjust_broadcast_factor(factor, image.shape)
+    img_adjust = image * factor
 
-    # shift pixel values
-    img_adjust: Tensor = image * factor
-
-    # truncate between pixel values
     if clip_output:
-        img_adjust = img_adjust.clamp(min=0.0, max=1.0)
-
+        return img_adjust.clamp_(min=0.0, max=1.0)  # in-place clamp to reduce memory
     return img_adjust
 
 
@@ -1049,6 +1044,24 @@ def invert(image: Tensor, max_val: Optional[Tensor] = None) -> Tensor:
         raise AssertionError(f"max_val is not a Tensor. Got: {type(_max_val)}")
 
     return _max_val.to(image) - image
+
+
+def _adjust_broadcast_factor(factor: Tensor, image_shape) -> Tensor:
+    # Helper to reshape factor efficiently
+    # Assume factor is already a tensor on image device and dtype
+    if factor.dim() == 0:
+        return factor
+    fdims = factor.shape
+    idims = image_shape
+    if len(fdims) == len(idims):
+        return factor
+    # Only expand as needed. (should be trailing batch dims only)
+    ndims_to_add = len(idims) - len(fdims)
+    if ndims_to_add > 0:
+        # Expand with broadcastable newaxes at end
+        expand_shape = fdims + (1,) * ndims_to_add
+        return factor.view(expand_shape)
+    return factor
 
 
 class AdjustSaturation(Module):
