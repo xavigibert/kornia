@@ -26,6 +26,8 @@ from typing_extensions import TypeGuard
 
 from kornia.core import Tensor
 
+"""The testing package contains testing-specific utilities."""
+
 __all__ = [
     "KORNIA_CHECK",
     "KORNIA_CHECK_DM_DESC",
@@ -464,3 +466,39 @@ def _handle_invalid_range(msg: Optional[str], raises: bool, min_val: float | Ten
     if raises:
         raise ValueError(err_msg)
     return False
+
+
+# Fast path for Tensor check to avoid function call overhead
+def _fast_tensor_check(x: object) -> bool:
+    return type(x) is Tensor or isinstance(x, Tensor)
+
+
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+
+def _sigmoid_operation(img: Tensor, cutoff: float, gain: float, inv: bool) -> Tensor:
+    # The core computation; vectorized for speed
+    x = gain * (cutoff - img)
+    x_exp = x.exp_()  # Inplace exponential, reduces memory allocations
+    if inv:
+        denom = 1 + x_exp
+        result = 1 - 1 / denom
+    else:
+        denom = 1 + x_exp
+        result = 1 / denom
+    return result
