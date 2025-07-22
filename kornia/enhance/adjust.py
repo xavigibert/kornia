@@ -919,7 +919,7 @@ def _build_lut(histo: Tensor, step: Tensor) -> Tensor:
 
 # Code taken from: https://github.com/pytorch/vision/pull/796
 def _scale_channel(im: Tensor) -> Tensor:
-    r"""Scale the data in the channel to implement equalize.
+    """Scale the data in the channel to implement equalize.
 
     Args:
         im: image tensor with shapes like :math:`(H, W)` or :math:`(D, H, W)`.
@@ -928,34 +928,53 @@ def _scale_channel(im: Tensor) -> Tensor:
         image tensor with the batch in the zero position.
 
     """
-    min_ = im.min()
-    max_ = im.max()
+    # Use a single pass to get min and max
+    min_, max_ = torch.aminmax(im)
 
-    if min_.item() < 0.0 and not torch.isclose(min_, torch.as_tensor(0.0, dtype=min_.dtype)):
-        raise ValueError(f"Values in the input tensor must greater or equal to 0.0. Found {min_.item()}.")
+    min_val = float(min_)
+    max_val = float(max_)
 
-    if max_.item() > 1.0 and not torch.isclose(max_, torch.as_tensor(1.0, dtype=max_.dtype)):
-        raise ValueError(f"Values in the input tensor must lower or equal to 1.0. Found {max_.item()}.")
+    # Use numeric comparison, removing unnecessary as_tensor
+    if min_val < 0.0 and not torch.isclose(min_, torch.tensor(0.0, dtype=min_.dtype, device=min_.device)):
+        raise ValueError(f"Values in the input tensor must greater or equal to 0.0. Found {min_val}.")
 
-    ndims = len(im.shape)
+    if max_val > 1.0 and not torch.isclose(max_, torch.tensor(1.0, dtype=max_.dtype, device=max_.device)):
+        raise ValueError(f"Values in the input tensor must lower or equal to 1.0. Found {max_val}.")
+
+    ndims = im.ndim
     if ndims not in (2, 3):
         raise TypeError(f"Input tensor must have 2 or 3 dimensions. Found {ndims}.")
 
-    im = im * 255.0
+    # Early exit for degenerate cases before any further work
+    if min_val == max_val:
+        # The image has a single value, so equalization is a no-op
+        return im.clone() if im.requires_grad else im
+
+    # Multiply by 255.0 in-place where it's not a view
+    # (require clone if grad, otherwise avoid new memory)
+    if im.is_contiguous() and not im.requires_grad:
+        im = im.mul(255.0)
+    else:
+        im = im * 255.0
+
     # Compute the histogram of the image channel.
     histo = _torch_histc_cast(im, bins=256, min=0, max=255)
     # For the purposes of computing the step, filter out the nonzeros.
-    nonzero_histo = torch.reshape(histo[histo != 0], [-1])
+    nz = histo != 0
+    nonzero_histo = histo[nz]
+    # If all histogram bins are zero (shouldn't usually happen, but protect)
+    if nonzero_histo.numel() == 0:
+        return im / 255.0
+
+    # Avoid unnecessary reshape
     step = torch.div(torch.sum(nonzero_histo) - nonzero_histo[-1], 255, rounding_mode="trunc")
 
-    # If step is zero, return the original image.  Otherwise, build
-    # lut from the full histogram and step and then index from it.
     if step == 0:
         result = im
     else:
-        # can't index using 2d index. Have to flatten and then reshape
-        result = torch.gather(_build_lut(histo, step), 0, im.flatten().long())
-        result = result.reshape_as(im)
+        lut = _build_lut(histo, step)
+        idx = im.flatten().long()
+        result = torch.gather(lut, 0, idx).view_as(im)
 
     return result / 255.0
 
@@ -992,7 +1011,7 @@ def equalize(input: Tensor) -> Tensor:
 
 @perform_keep_shape_video
 def equalize3d(input: Tensor) -> Tensor:
-    r"""Equalize the values for a 3D volumetric tensor.
+    """Equalize the values for a 3D volumetric tensor.
 
     Implements Equalize function for a sequence of images using PyTorch ops based on uint8 format:
     https://github.com/tensorflow/tpu/blob/master/models/official/efficientnet/autoaugment.py#L352
@@ -1004,14 +1023,8 @@ def equalize3d(input: Tensor) -> Tensor:
         Equalized volume with shape :math:`(B, C, D, H, W)`.
 
     """
-    res = []
-    for volume in input:
-        # Assumes RGB for now.  Scales each channel independently
-        # and then stacks the result.
-        scaled_input = torch.stack([_scale_channel(volume[i, :, :, :]) for i in range(len(volume))])
-        res.append(scaled_input)
-
-    return torch.stack(res)
+    # Process each volume and all its channels with optimized stack
+    return torch.stack([torch.stack([_scale_channel(ch) for ch in volume], dim=0) for volume in input])
 
 
 def invert(image: Tensor, max_val: Optional[Tensor] = None) -> Tensor:
