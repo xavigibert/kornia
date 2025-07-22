@@ -1051,6 +1051,23 @@ def invert(image: Tensor, max_val: Optional[Tensor] = None) -> Tensor:
     return _max_val.to(image) - image
 
 
+def _adjust_sigmoid_fast(image: Tensor, cutoff: float, gain: float, inv: bool) -> Tensor:
+    # Helper function to compute sigmoid adjustment in-place when possible and avoid temporary tensors.
+    KORNIA_CHECK_IS_TENSOR(image, "Expected shape (*, H, W)")
+    # Compute cutoff - image once, reuse, then inplace exp for improved performance
+    diff = cutoff - image
+    # Store gain*diff in a tensor, in-place if possible
+    t = diff.mul_(gain) if image.is_floating_point() and image.is_leaf else diff * gain
+    t_exp = t.exp_() if t.is_leaf and t.is_floating_point() else t.exp()
+    denom = t_exp.add_(1) if t_exp.is_leaf and t_exp.is_floating_point() else t_exp + 1
+    if inv:
+        # 1 - 1 / denom
+        out = 1.0 - denom.reciprocal_() if denom.is_leaf and denom.is_floating_point() else 1.0 - 1.0 / denom
+    else:
+        out = denom.reciprocal_() if denom.is_leaf and denom.is_floating_point() else 1.0 / denom
+    return out
+
+
 class AdjustSaturation(Module):
     r"""Adjust color saturation of an image.
 
@@ -1384,7 +1401,8 @@ class AdjustSigmoid(Module):
         self.inv: bool = inv
 
     def forward(self, image: Tensor) -> Tensor:
-        return adjust_sigmoid(image, cutoff=self.cutoff, gain=self.gain, inv=self.inv)
+        # Use the optimized helper directly to enable fused in-place behavior if possible
+        return _adjust_sigmoid_fast(image, self.cutoff, self.gain, self.inv)
 
 
 class AdjustLog(Module):
