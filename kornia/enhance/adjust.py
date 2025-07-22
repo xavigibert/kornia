@@ -65,7 +65,7 @@ def adjust_saturation_raw(image: Tensor, factor: Union[float, Tensor]) -> Tensor
 
 
 def adjust_saturation_with_gray_subtraction(image: Tensor, factor: Union[float, Tensor]) -> Tensor:
-    r"""Adjust color saturation of an image by blending the image with its grayscaled version.
+    """Adjust color saturation of an image by blending the image with its grayscaled version.
 
     The image is expected to be an RGB image or a gray image in the range of [0, 1].
     If it is an RGB image, returns blending of the image with its grayscaled version.
@@ -93,6 +93,7 @@ def adjust_saturation_with_gray_subtraction(image: Tensor, factor: Union[float, 
         torch.Size([2, 3, 3, 3])
 
     """
+    # Fast checks
     KORNIA_CHECK_IS_TENSOR(image, "Expected shape (*, H, W)")
     KORNIA_CHECK(isinstance(factor, (float, Tensor)), "Factor should be float or Tensor.")
     KORNIA_CHECK_IS_COLOR_OR_GRAY(image, "Image should be an RGB or gray image")
@@ -100,25 +101,22 @@ def adjust_saturation_with_gray_subtraction(image: Tensor, factor: Union[float, 
     if image.shape[-3] == 1:
         return image
 
-    if isinstance(factor, float):
-        # TODO: figure out how to create later a tensor without importing torch
-        factor = torch.as_tensor(factor, device=image.device, dtype=image.dtype)
-    elif isinstance(factor, Tensor):
-        factor = factor.to(image.device, image.dtype)
+    # Preprocess factor with fast helpers
+    factor = _prepare_factor(factor, image)
+    factor = _broadcast_factor(factor, image)
 
-    # make factor broadcastable
-    while len(factor.shape) != len(image.shape):
-        factor = factor[..., None]
-
+    # Avoid unnecessary ops by pre-doing 1-factor, fuse grayscale computation
     x_other: Tensor = rgb_to_grayscale(image)
+    x_adjusted: Tensor = torch.addcmul(x_other, factor, image - x_other)
 
-    # blend the image with the grayscaled image
-    x_adjusted: Tensor = (1 - factor) * x_other + factor * image
-
-    # clamp the output
-    out: Tensor = torch.clamp(x_adjusted, 0.0, 1.0)
-
-    return out
+    # Clamp output (can fuse with out allocation)
+    if torch.is_floating_point(x_adjusted):
+        # Use in-place clamp when possible to save mem
+        x_adjusted.clamp_(0.0, 1.0)
+        return x_adjusted
+    else:
+        # safety fallback
+        return torch.clamp(x_adjusted, 0.0, 1.0)
 
 
 def adjust_saturation(image: Tensor, factor: Union[float, Tensor]) -> Tensor:
@@ -1049,6 +1047,40 @@ def invert(image: Tensor, max_val: Optional[Tensor] = None) -> Tensor:
         raise AssertionError(f"max_val is not a Tensor. Got: {type(_max_val)}")
 
     return _max_val.to(image) - image
+
+
+def _prepare_factor(factor: Union[float, Tensor], image: Tensor) -> Tensor:
+    # Fast path: float scaler (most likely)
+    if isinstance(factor, float):
+        # use like-new tensor
+        t = torch.empty((), device=image.device, dtype=image.dtype)
+        t.fill_(factor)
+        factor = t
+    elif isinstance(factor, Tensor):
+        if not (factor.device == image.device and factor.dtype == image.dtype):
+            factor = factor.to(image.device, image.dtype)
+    return factor
+
+
+def _broadcast_factor(factor: Tensor, image: Tensor) -> Tensor:
+    """Broadcast factor to match image shape on batch if needed."""
+    # If already broadcastable, skip
+    ndim_f, ndim_x = factor.ndim, image.ndim
+    if ndim_f == ndim_x:
+        if factor.shape == image.shape:
+            return factor
+        # check: single-element batch or channel?
+        shape_diffs = [i for i, (a, b) in enumerate(zip(factor.shape, image.shape)) if a != b]
+        if not shape_diffs:
+            return factor
+    # Try to expand batch and channel
+    while factor.ndim < image.ndim:
+        factor = factor.unsqueeze(-1)
+    # Now try to expand for broadcasting in batch dimension if necessary
+    if factor.shape[0] == 1 and image.shape[0] > 1 and factor.shape[1:] == ():
+        # Handle special case: scalar batch, broadcast to batch
+        factor = factor.expand(image.shape[0], *factor.shape[1:])
+    return factor
 
 
 class AdjustSaturation(Module):
