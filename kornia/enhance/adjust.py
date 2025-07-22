@@ -616,16 +616,32 @@ def adjust_log(image: Tensor, gain: float = 1, inv: bool = False, clip_output: b
                   [0., 0.]]]])
 
     """
+    # Fast exit: no unnecessary code changes, but push expensive ops together for efficiency
     KORNIA_CHECK_IS_TENSOR(image, "Expected shape (*, H, W)")
 
-    if inv:
-        img_adjust = (2**image - 1) * gain
-    else:
-        img_adjust = (1 + image).log2() * gain
+    # Combine operations for in-place, memory-efficient execution
+    # Note: no in-place on log2 as log2_(...) is not available for some tensor types, but rely on PyTorch fusion
 
-    # truncate between pixel values
+    if inv:
+        # Use .mul_ and .add_ if gain != 1 for potential in-place but only if safe (not needed as only 1 statement)
+        img_adjust = (2.0**image).sub_(1.0) if gain == 1 else (2.0**image - 1.0) * gain
+    # fuse add/log2/gain as much as possible
+    elif gain == 1:
+        img_adjust = (image + 1.0).log2()
+    else:
+        img_adjust = (
+            (image + 1.0).log2_().mul_(gain)
+            if image.is_floating_point() and image.is_leaf and image.requires_grad is False
+            else (image + 1.0).log2() * gain
+        )
+
+    # Clamp only if necessary
     if clip_output:
-        img_adjust = img_adjust.clamp(min=0.0, max=1.0)
+        img_adjust = (
+            img_adjust.clamp_(min=0.0, max=1.0)
+            if img_adjust.is_floating_point() and img_adjust.is_leaf and img_adjust.requires_grad is False
+            else img_adjust.clamp(min=0.0, max=1.0)
+        )
 
     return img_adjust
 
