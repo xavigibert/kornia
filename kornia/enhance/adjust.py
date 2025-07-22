@@ -583,13 +583,11 @@ def adjust_sigmoid(image: Tensor, cutoff: float = 0.5, gain: float = 10, inv: bo
                   [0.5000, 0.5000]]]])
 
     """
-    KORNIA_CHECK_IS_TENSOR(image, "Expected shape (*, H, W)")
-
-    if inv:
-        img_adjust = 1 - 1 / (1 + (gain * (cutoff - image)).exp())
-    else:
-        img_adjust = 1 / (1 + (gain * (cutoff - image)).exp())
-    return img_adjust
+    # Fast type guard
+    if not _fast_tensor_check(image):
+        raise TypeError("Expected shape (*, H, W)")
+    # Compute Sigmoid adjustment (optimized)
+    return _sigmoid_operation(image, cutoff, gain, inv)
 
 
 def adjust_log(image: Tensor, gain: float = 1, inv: bool = False, clip_output: bool = True) -> Tensor:
@@ -1049,6 +1047,42 @@ def invert(image: Tensor, max_val: Optional[Tensor] = None) -> Tensor:
         raise AssertionError(f"max_val is not a Tensor. Got: {type(_max_val)}")
 
     return _max_val.to(image) - image
+
+
+# Fast path for Tensor check to avoid function call overhead
+def _fast_tensor_check(x: object) -> bool:
+    return type(x) is Tensor or isinstance(x, Tensor)
+
+
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+
+def _sigmoid_operation(img: Tensor, cutoff: float, gain: float, inv: bool) -> Tensor:
+    # The core computation; vectorized for speed
+    x = gain * (cutoff - img)
+    x_exp = x.exp_()  # Inplace exponential, reduces memory allocations
+    if inv:
+        denom = 1 + x_exp
+        result = 1 - 1 / denom
+    else:
+        denom = 1 + x_exp
+        result = 1 / denom
+    return result
 
 
 class AdjustSaturation(Module):
