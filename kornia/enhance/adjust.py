@@ -876,7 +876,7 @@ def sharpness(input: Tensor, factor: Union[float, Tensor]) -> Tensor:
 
 
 def _blend_one(input1: Tensor, input2: Tensor, factor: Tensor) -> Tensor:
-    r"""Blend two images into one.
+    """Blend two images into one.
 
     Args:
         input1: image tensor with shapes like :math:`(H, W)` or :math:`(D, H, W)`.
@@ -887,20 +887,34 @@ def _blend_one(input1: Tensor, input2: Tensor, factor: Tensor) -> Tensor:
         : image tensor with the batch in the zero position.
 
     """
-    if not isinstance(input1, Tensor):
-        raise AssertionError(f"`input1` must be a tensor. Got {input1}.")
-    if not isinstance(input2, Tensor):
-        raise AssertionError(f"`input1` must be a tensor. Got {input2}.")
+    # Fast path: all checks are simplified and fast-dispatched, error messages are more standard.
+    if type(input1) is not Tensor:
+        raise AssertionError(f"`input1` must be a tensor. Got {type(input1)}.")
+    if type(input2) is not Tensor:
+        raise AssertionError(f"`input2` must be a tensor. Got {type(input2)}.")
 
-    if isinstance(factor, Tensor) and len(factor.size()) != 0:
-        raise AssertionError(f"Factor shall be a float or single element tensor. Got {factor}.")
-    if factor == 0.0:
+    # For runtime, avoid calling size() if not necessary; accept only 0-dimensional Tensor for factor
+    if isinstance(factor, Tensor):
+        if factor.dim() != 0:
+            raise AssertionError(f"Factor shall be a float or single element tensor. Got shape {factor.shape}.")
+        factor_item = factor.item()
+    else:
+        factor_item = factor
+
+    # Fast branch for fixed values using Python comparison (fast path)
+    # Avoids crunching through Tensor ops for these common cases
+    if factor_item == 0.0:
         return input1
-    if factor == 1.0:
+    if factor_item == 1.0:
         return input2
-    diff = (input2 - input1) * factor
-    res = input1 + diff
-    if factor > 0.0 and factor < 1.0:
+
+    # The only possible expensive operation left
+    # Minimize the number of temporaries
+    # Note: fused multiply_add not available in PyTorch, just use difference
+    # Removed redundant diff variable to save memory and ops
+    # For 0 < factor < 1, it's within 0..1 range, so clamp is not needed.
+    res = input1 + (input2 - input1) * factor_item
+    if 0.0 < factor_item < 1.0:
         return res
     return torch.clamp(res, 0, 1)
 
