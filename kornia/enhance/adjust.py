@@ -919,7 +919,7 @@ def _build_lut(histo: Tensor, step: Tensor) -> Tensor:
 
 # Code taken from: https://github.com/pytorch/vision/pull/796
 def _scale_channel(im: Tensor) -> Tensor:
-    r"""Scale the data in the channel to implement equalize.
+    """Scale the data in the channel to implement equalize.
 
     Args:
         im: image tensor with shapes like :math:`(H, W)` or :math:`(D, H, W)`.
@@ -937,32 +937,32 @@ def _scale_channel(im: Tensor) -> Tensor:
     if max_.item() > 1.0 and not torch.isclose(max_, torch.as_tensor(1.0, dtype=max_.dtype)):
         raise ValueError(f"Values in the input tensor must lower or equal to 1.0. Found {max_.item()}.")
 
-    ndims = len(im.shape)
+    ndims = im.ndim
     if ndims not in (2, 3):
         raise TypeError(f"Input tensor must have 2 or 3 dimensions. Found {ndims}.")
 
-    im = im * 255.0
-    # Compute the histogram of the image channel.
-    histo = _torch_histc_cast(im, bins=256, min=0, max=255)
-    # For the purposes of computing the step, filter out the nonzeros.
-    nonzero_histo = torch.reshape(histo[histo != 0], [-1])
+    im_255 = im * 255.0
+    histo = _torch_histc_cast(im_255, bins=256, min=0, max=255)
+    nonzero_histo = histo[histo != 0].reshape(-1)
+    if nonzero_histo.numel() == 0:
+        return im  # Faster short-circuit: if no nonzero bins
+
     step = torch.div(torch.sum(nonzero_histo) - nonzero_histo[-1], 255, rounding_mode="trunc")
 
     # If step is zero, return the original image.  Otherwise, build
     # lut from the full histogram and step and then index from it.
     if step == 0:
-        result = im
-    else:
-        # can't index using 2d index. Have to flatten and then reshape
-        result = torch.gather(_build_lut(histo, step), 0, im.flatten().long())
-        result = result.reshape_as(im)
-
+        return im
+    lut = _build_lut(histo, step)
+    flat = im_255.flatten().long()
+    # Faster than .gather for 1D indexing on 1D lut
+    result = lut[flat].reshape_as(im_255)
     return result / 255.0
 
 
 @perform_keep_shape_image
 def equalize(input: Tensor) -> Tensor:
-    r"""Apply equalize on the input tensor.
+    """Apply equalize on the input tensor.
 
     .. image:: _static/img/equalize.png
 
@@ -981,13 +981,25 @@ def equalize(input: Tensor) -> Tensor:
         torch.Size([1, 2, 3, 3])
 
     """
-    res = []
-    for image in input:
-        # Assumes RGB for now.  Scales each channel independently
-        # and then stacks the result.
-        scaled_image = torch.stack([_scale_channel(image[i, :, :]) for i in range(len(image))])
-        res.append(scaled_image)
-    return torch.stack(res)
+    # input: (*, C, H, W)
+    # Process all images and all channels in a batch fashion where possible.
+    s = input.shape
+    n_dim = len(s)
+    if n_dim < 3:
+        raise ValueError("Input must have at least 3 dims (C, H, W)")
+
+    # Merge any leading batch dimensions so we have (N, C, H, W)
+    batch_flat = input.reshape(-1, *s[-3:])  # (batch, C, H, W)
+    # Vectorized operation over batch (N) and channel (C)
+    batch, c = batch_flat.shape[:2]
+    # Stack all channels from all images into a list for parallel processing
+    channels = batch_flat.reshape(batch * c, *batch_flat.shape[2:])  # (batch*c, H, W)
+    # Use torch.stack to parallelize over channel dimension
+    processed = torch.stack([_scale_channel(ch) for ch in channels], dim=0)
+    processed = processed.reshape(batch, c, *batch_flat.shape[2:])
+
+    # Reshape back to original
+    return processed.reshape(*s)
 
 
 @perform_keep_shape_video
