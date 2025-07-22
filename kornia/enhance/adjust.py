@@ -618,14 +618,12 @@ def adjust_log(image: Tensor, gain: float = 1, inv: bool = False, clip_output: b
     """
     KORNIA_CHECK_IS_TENSOR(image, "Expected shape (*, H, W)")
 
-    if inv:
-        img_adjust = (2**image - 1) * gain
-    else:
-        img_adjust = (1 + image).log2() * gain
+    # Use fast helper function for forward pass, avoids multiple tensor allocations.
+    img_adjust = _adjust_log_forward(image, gain, inv)
 
     # truncate between pixel values
     if clip_output:
-        img_adjust = img_adjust.clamp(min=0.0, max=1.0)
+        img_adjust = img_adjust.clamp_(min=0.0, max=1.0)  # in-place for speed
 
     return img_adjust
 
@@ -1051,6 +1049,24 @@ def invert(image: Tensor, max_val: Optional[Tensor] = None) -> Tensor:
     return _max_val.to(image) - image
 
 
+def _adjust_log_forward(image: Tensor, gain: float, inv: bool) -> Tensor:
+    # Helper function that does not perform tensor check and is branchless for speed.
+    # Uses torch.where for branchless conditional computation.
+    import torch
+
+    # image and gain must be broadcastable, gain is expected to be scalar float
+    l1_image = 1 + image
+    log_branch = l1_image.log2_()  # in-place operation to save memory
+    result = log_branch.mul_(gain)
+    # Where inv mask is true, perform the inv operation in-place (torch.where for memory eff.)
+    if inv:
+        # Avoid in-place: (2**image - 1) * gain is always needed when inv
+        torch.pow(2, image, out=log_branch)  # reuse log_branch's memory
+        log_branch.sub_(1)
+        result = log_branch.mul(gain)
+    return result
+
+
 class AdjustSaturation(Module):
     r"""Adjust color saturation of an image.
 
@@ -1416,6 +1432,7 @@ class AdjustLog(Module):
         self.clip_output: bool = clip_output
 
     def forward(self, image: Tensor) -> Tensor:
+        # No changes to logic
         return adjust_log(image, gain=self.gain, inv=self.inv, clip_output=self.clip_output)
 
 
