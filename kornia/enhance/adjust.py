@@ -631,7 +631,7 @@ def adjust_log(image: Tensor, gain: float = 1, inv: bool = False, clip_output: b
 
 
 def _solarize(input: Tensor, thresholds: Union[float, Tensor] = 0.5) -> Tensor:
-    r"""For each pixel in the image, select the pixel if the value is less than the threshold.
+    """For each pixel in the image, select the pixel if the value is less than the threshold.
 
     Otherwise, subtract 1.0 from the pixel.
 
@@ -651,12 +651,15 @@ def _solarize(input: Tensor, thresholds: Union[float, Tensor] = 0.5) -> Tensor:
     if not isinstance(thresholds, (float, Tensor)):
         raise TypeError(f"The factor should be either a float or Tensor. Got {type(thresholds)}")
 
-    if isinstance(thresholds, Tensor) and len(thresholds.shape) != 0:
-        if not (input.size(0) == len(thresholds) and len(thresholds.shape) == 1):
-            raise AssertionError(f"thresholds must be a 1-d vector of shape ({input.size(0)},). Got {thresholds}")
-        # TODO: I am not happy about this line, but no easy to do batch-wise operation
-        thresholds = thresholds.to(input.device).to(input.dtype)
-        thresholds = torch.stack([x.expand(*input.shape[-3:]) for x in thresholds])
+    # Optimize expansion logic using broadcasting instead of stack+expand
+    if isinstance(thresholds, Tensor) and thresholds.ndim != 0:
+        # thresholds is 1-d: [B], should broadcast to input's batch dim
+        thresholds = thresholds.to(dtype=input.dtype, device=input.device)
+        # Use broadcasting, not stack/expand, for last-dim expansion. This is faster and saves memory.
+        thresholds = _expand_param_for_batch(thresholds, input.shape)
+
+    elif isinstance(thresholds, float):
+        thresholds = torch.tensor(thresholds, dtype=input.dtype, device=input.device)
 
     return torch.where(input < thresholds, input, 1.0 - input)
 
@@ -666,7 +669,7 @@ def solarize(
     thresholds: Union[float, Tensor] = 0.5,
     additions: Optional[Union[float, Tensor]] = None,
 ) -> Tensor:
-    r"""For each pixel in the image less than threshold.
+    """For each pixel in the image less than threshold.
 
     .. image:: _static/img/solarize.png
 
@@ -706,26 +709,26 @@ def solarize(
         raise TypeError(f"The factor should be either a float or Tensor. Got {type(thresholds)}")
 
     if isinstance(thresholds, float):
-        thresholds = torch.as_tensor(thresholds)
+        thresholds = torch.tensor(thresholds, dtype=input.dtype, device=input.device)
 
     if additions is not None:
         if not isinstance(additions, (float, Tensor)):
             raise TypeError(f"The factor should be either a float or Tensor. Got {type(additions)}")
 
         if isinstance(additions, float):
-            additions = torch.as_tensor(additions)
+            additions = torch.tensor(additions, dtype=input.dtype, device=input.device)
 
-        if not torch.all((additions < 0.5) * (additions > -0.5)):
+        # Optimize: Instead of (additions < 0.5) * (additions > -0.5), just use chained comparison
+        # Also, all() is faster than multiplication and then all()
+        if not torch.all((additions > -0.5) & (additions < 0.5)):
             raise AssertionError(f"The value of 'addition' is between -0.5 and 0.5. Got {additions}.")
 
-        if isinstance(additions, Tensor) and len(additions.shape) != 0:
-            if not (input.size(0) == len(additions) and len(additions.shape) == 1):
-                raise AssertionError(f"additions must be a 1-d vector of shape ({input.size(0)},). Got {additions}")
-            # TODO: I am not happy about this line, but no easy to do batch-wise operation
-            additions = additions.to(input.device).to(input.dtype)
-            additions = torch.stack([x.expand(*input.shape[-3:]) for x in additions])
-        input = input + additions
-        input = input.clamp(0.0, 1.0)
+        # Efficient broadcast for additions.
+        if isinstance(additions, Tensor) and additions.ndim != 0:
+            additions = additions.to(dtype=input.dtype, device=input.device)
+            additions = _expand_param_for_batch(additions, input.shape)
+        input = torch.add(input, additions)
+        input = torch.clamp(input, 0.0, 1.0)
 
     return _solarize(input, thresholds)
 
@@ -1049,6 +1052,15 @@ def invert(image: Tensor, max_val: Optional[Tensor] = None) -> Tensor:
         raise AssertionError(f"max_val is not a Tensor. Got: {type(_max_val)}")
 
     return _max_val.to(image) - image
+
+
+def _expand_param_for_batch(t: Tensor, batch_shape: torch.Size) -> Tensor:
+    # Fast batch-wise expansion for batch-size 1 or element-wise vectors
+    if t.ndim == 0:
+        return t.expand(batch_shape)
+    elif t.ndim == 1 and t.shape[0] == batch_shape[0]:
+        return t.view(-1, *[1] * (len(batch_shape) - 1)).expand(batch_shape)
+    raise AssertionError(f"Parameter must be scalar or a 1-d vector of shape ({batch_shape[0]},). Got shape {t.shape}")
 
 
 class AdjustSaturation(Module):
