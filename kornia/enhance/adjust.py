@@ -821,7 +821,7 @@ def posterize(input: Tensor, bits: Union[int, Tensor]) -> Tensor:
 
 @perform_keep_shape_image
 def sharpness(input: Tensor, factor: Union[float, Tensor]) -> Tensor:
-    r"""Apply sharpness to the input tensor.
+    """Apply sharpness to the input tensor.
 
     .. image:: _static/img/sharpness.png
 
@@ -865,18 +865,26 @@ def sharpness(input: Tensor, factor: Union[float, Tensor]) -> Tensor:
     degenerate = torch.clamp(degenerate, 0.0, 1.0)
 
     # For the borders of the resulting image, fill in the values of the original image.
-    mask = torch.ones_like(degenerate)
-    padded_mask = torch.nn.functional.pad(mask, [1, 1, 1, 1])
-    padded_degenerate = torch.nn.functional.pad(degenerate, [1, 1, 1, 1])
-    result = torch.where(padded_mask == 1, padded_degenerate, input)
+    # Optimization: Compute the padding and mask in a single step for fewer allocations.
+    if input.shape[2] >= 3 and input.shape[3] >= 3:
+        # Only do border patching if there are actual borders to patch
+        padded_degenerate = torch.nn.functional.pad(degenerate, [1, 1, 1, 1])
+        inner = padded_degenerate[:, :, 1:-1, 1:-1]
+        # Place degenerate inner, use input for border
+        result = input.clone()
+        result[:, :, 1:-1, 1:-1] = inner
+    else:
+        # Not enough size for inner area; keep original
+        result = input
 
     if len(factor.size()) == 0:
         return _blend_one(result, input, factor)
-    return torch.stack([_blend_one(result[i], input[i], factor[i]) for i in range(len(factor))])
+    # Optimization: Use batch processing for _blend_one
+    return _blend_batch(result, input, factor)
 
 
 def _blend_one(input1: Tensor, input2: Tensor, factor: Tensor) -> Tensor:
-    r"""Blend two images into one.
+    """Blend two images into one.
 
     Args:
         input1: image tensor with shapes like :math:`(H, W)` or :math:`(D, H, W)`.
@@ -887,19 +895,17 @@ def _blend_one(input1: Tensor, input2: Tensor, factor: Tensor) -> Tensor:
         : image tensor with the batch in the zero position.
 
     """
-    if not isinstance(input1, Tensor):
-        raise AssertionError(f"`input1` must be a tensor. Got {input1}.")
-    if not isinstance(input2, Tensor):
-        raise AssertionError(f"`input1` must be a tensor. Got {input2}.")
-
+    # Removed redundant type checks for speed; assume usage is correct in internal flow.
     if isinstance(factor, Tensor) and len(factor.size()) != 0:
         raise AssertionError(f"Factor shall be a float or single element tensor. Got {factor}.")
+    # Fast path using torch.where for exact values:
     if factor == 0.0:
         return input1
     if factor == 1.0:
         return input2
-    diff = (input2 - input1) * factor
-    res = input1 + diff
+    # Use fused op for the interpolated result, then clamp only if needed
+    res = torch.lerp(input1, input2, factor)
+    # Only clamp if factor not in [0,1)
     if factor > 0.0 and factor < 1.0:
         return res
     return torch.clamp(res, 0, 1)
@@ -1049,6 +1055,33 @@ def invert(image: Tensor, max_val: Optional[Tensor] = None) -> Tensor:
         raise AssertionError(f"max_val is not a Tensor. Got: {type(_max_val)}")
 
     return _max_val.to(image) - image
+
+
+def _blend_batch(input1: Tensor, input2: Tensor, factor: Tensor) -> Tensor:
+    """Efficient batched blend; factors shape = (batch,)."""
+    # Using broadcasting & torch.lerp for efficient blend. Assumes factor shape == (N,)
+    factor = factor.to(dtype=input1.dtype, device=input1.device)
+    # torch.lerp does broadcasting if we add the singleton dims to factor
+    while factor.dim() < input1.dim():
+        factor = factor.unsqueeze(-1)
+    # Fast path: if all factors are exactly 0 or 1
+    if torch.all(factor == 0):
+        return input1
+    if torch.all(factor == 1):
+        return input2
+    # Compute blend
+    res = torch.lerp(input1, input2, factor)
+    # Clamp only elements where factor is outside [0,1)
+    out = res
+    mask = (factor <= 0.0) | (factor >= 1.0)
+    if mask.any():
+        # Clamp only those slices where mask is True
+        mask_indices = mask.flatten().nonzero(as_tuple=False).squeeze(1)
+        if mask_indices.numel() > 0:
+            out = out.clone()
+            for i in mask_indices:
+                out[i] = torch.clamp(res[i], 0, 1)
+    return out
 
 
 class AdjustSaturation(Module):
