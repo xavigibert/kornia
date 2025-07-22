@@ -312,7 +312,7 @@ def adjust_gamma(input: Tensor, gamma: Union[float, Tensor], gain: Union[float, 
 
 
 def adjust_contrast(image: Tensor, factor: Union[float, Tensor], clip_output: bool = True) -> Tensor:
-    r"""Adjust the contrast of an image tensor.
+    """Adjust the contrast of an image tensor.
 
     .. image:: _static/img/adjust_contrast.png
 
@@ -355,27 +355,24 @@ def adjust_contrast(image: Tensor, factor: Union[float, Tensor], clip_output: bo
 
     """
     KORNIA_CHECK_IS_TENSOR(image, "Expected shape (*, H, W)")
-    KORNIA_CHECK(isinstance(factor, (float, Tensor)), "Factor should be float or Tensor.")
-
-    if isinstance(factor, float):
-        # TODO: figure out how to create later a tensor without importing torch
-        factor = torch.as_tensor(factor, device=image.device, dtype=image.dtype)
-    elif isinstance(factor, Tensor):
-        factor = factor.to(image.device, image.dtype)
-
-    # make factor broadcastable
-    while len(factor.shape) != len(image.shape):
-        factor = factor[..., None]
-
-    KORNIA_CHECK(any(factor >= 0), "Contrast factor must be positive.")
-
-    # Apply contrast factor to each channel
-    img_adjust: Tensor = image * factor
-
-    # Truncate between pixel values
+    # Inline/fast check for performance; skip repeated KORNIA_CHECK or unnecessary type-checks.
+    if not (isinstance(factor, float) or isinstance(factor, Tensor)):
+        raise Exception("Factor should be float or Tensor.")
+    # Convert float to same dtype/device as image efficiently.
+    if not isinstance(factor, Tensor):
+        factor = torch.tensor(factor, device=image.device, dtype=image.dtype)
+    # Only move/cast if necessary.
+    elif factor.device != image.device or factor.dtype != image.dtype:
+        factor = factor.to(device=image.device, dtype=image.dtype)
+    # Efficient broadcasting of factor via shape (by .reshape, not repeated expand)
+    factor_broadcasted = _broadcast_contrast_factor(factor, image.shape)
+    # Fast positivity check.
+    if torch.any(factor_broadcasted < 0):
+        raise Exception("Contrast factor must be positive.")
+    img_adjust: Tensor = image * factor_broadcasted
     if clip_output:
-        img_adjust = img_adjust.clamp(min=0.0, max=1.0)
-
+        # in-place for memory efficiency if safe; clamp is fast (uses ATen for tensors).
+        img_adjust = img_adjust.clamp_(0.0, 1.0)
     return img_adjust
 
 
@@ -1049,6 +1046,16 @@ def invert(image: Tensor, max_val: Optional[Tensor] = None) -> Tensor:
         raise AssertionError(f"max_val is not a Tensor. Got: {type(_max_val)}")
 
     return _max_val.to(image) - image
+
+
+def _broadcast_contrast_factor(factor: Tensor, image_shape: torch.Size) -> Tensor:
+    # This helper broadcasts factor tensor to image shape using tensor broadcasting rules,
+    # as efficiently as possible using .reshape with 1's for extra dimensions.
+    num_dims_diff = len(image_shape) - len(factor.shape)
+    if num_dims_diff > 0:
+        # Add singleton dimensions to the end to match shape (broadcasting-friendly)
+        factor = factor.reshape(list(factor.shape) + [1] * num_dims_diff)
+    return factor
 
 
 class AdjustSaturation(Module):
