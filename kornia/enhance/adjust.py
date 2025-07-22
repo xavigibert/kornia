@@ -438,7 +438,7 @@ def adjust_contrast_with_mean_subtraction(image: Tensor, factor: Union[float, Te
 
 
 def adjust_brightness(image: Tensor, factor: Union[float, Tensor], clip_output: bool = True) -> Tensor:
-    r"""Adjust the brightness of an image tensor.
+    """Adjust the brightness of an image tensor.
 
     .. image:: _static/img/adjust_brightness.png
 
@@ -484,23 +484,23 @@ def adjust_brightness(image: Tensor, factor: Union[float, Tensor], clip_output: 
     KORNIA_CHECK_IS_TENSOR(image, "Expected shape (*, H, W)")
     KORNIA_CHECK(isinstance(factor, (float, Tensor)), "Factor should be float or Tensor.")
 
-    # convert factor to a tensor
+    # Fast path: float factor
     if isinstance(factor, float):
-        # TODO: figure out how to create later a tensor without importing torch
-        factor = torch.as_tensor(factor, device=image.device, dtype=image.dtype)
-    elif isinstance(factor, Tensor):
-        factor = factor.to(image.device, image.dtype)
+        # No need to .as_tensor/unsqueeze if it is a float (broadcasting is handled by torch)
+        img_adjust = image + factor
+    else:
+        factor = factor.to(device=image.device, dtype=image.dtype, copy=False)
+        # Only unsqueeze if necessary and if shapes aren't already compatible
+        if factor.ndim < image.ndim:
+            factor = _make_broadcastable_factor(factor, image.shape)
+        img_adjust = image + factor
 
-    # make factor broadcastable
-    while len(factor.shape) != len(image.shape):
-        factor = factor[..., None]
-
-    # shift pixel values
-    img_adjust: Tensor = image + factor
-
-    # truncate between pixel values
     if clip_output:
-        img_adjust = img_adjust.clamp(min=0.0, max=1.0)
+        # Use in-place clamp_ if possible, else clamp (preserves memory for big tensors)
+        if torch.is_floating_point(img_adjust) and img_adjust.is_leaf:
+            img_adjust.clamp_(min=0.0, max=1.0)
+        else:
+            img_adjust = img_adjust.clamp(min=0.0, max=1.0)
 
     return img_adjust
 
@@ -1049,6 +1049,14 @@ def invert(image: Tensor, max_val: Optional[Tensor] = None) -> Tensor:
         raise AssertionError(f"max_val is not a Tensor. Got: {type(_max_val)}")
 
     return _max_val.to(image) - image
+
+
+def _make_broadcastable_factor(factor: Tensor, image_shape: torch.Size) -> Tensor:
+    # Helper to unsqueeze factor to be broadcastable with image
+    dims_to_add = len(image_shape) - factor.ndim
+    if dims_to_add <= 0:
+        return factor
+    return factor[(...,) + (None,) * dims_to_add]
 
 
 class AdjustSaturation(Module):
