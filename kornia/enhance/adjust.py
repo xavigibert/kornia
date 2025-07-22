@@ -275,39 +275,14 @@ def adjust_gamma(input: Tensor, gamma: Union[float, Tensor], gain: Union[float, 
     if not isinstance(input, Tensor):
         raise TypeError(f"Input type is not a Tensor. Got {type(input)}")
 
-    if not isinstance(gamma, (float, Tensor)):
-        raise TypeError(f"The gamma should be a positive float or Tensor. Got {type(gamma)}")
-
-    if not isinstance(gain, (float, Tensor)):
-        raise TypeError(f"The gain should be a positive float or Tensor. Got {type(gain)}")
-
-    if isinstance(gamma, float):
-        gamma = Tensor([gamma])
-
-    if isinstance(gain, float):
-        gain = Tensor([gain])
-
-    gamma = gamma.to(input.device).to(input.dtype)
-    gain = gain.to(input.device).to(input.dtype)
-
-    if (gamma < 0.0).any():
-        raise ValueError(f"Gamma must be non-negative. Got {gamma}")
-
-    if (gain < 0.0).any():
-        raise ValueError(f"Gain must be non-negative. Got {gain}")
-
-    for _ in range(len(input.shape) - len(gamma.shape)):
-        gamma = torch.unsqueeze(gamma, dim=-1)
-
-    for _ in range(len(input.shape) - len(gain.shape)):
-        gain = torch.unsqueeze(gain, dim=-1)
+    gamma_t = _expand_param_like(gamma, input, "gamma")
+    gain_t = _expand_param_like(gain, input, "gain")
 
     # Apply the gamma correction
-    x_adjust: Tensor = gain * torch.pow(input, gamma)
-
+    # Use out-of-place pow to avoid contaminating input with broadcasting.
+    x_adjust: Tensor = gain_t * torch.pow(input, gamma_t)
     # Truncate between pixel values
     out: Tensor = torch.clamp(x_adjust, 0.0, 1.0)
-
     return out
 
 
@@ -1049,6 +1024,30 @@ def invert(image: Tensor, max_val: Optional[Tensor] = None) -> Tensor:
         raise AssertionError(f"max_val is not a Tensor. Got: {type(_max_val)}")
 
     return _max_val.to(image) - image
+
+
+def _expand_param_like(param, input: Tensor, param_name: str) -> Tensor:
+    """Helper to convert a float or Tensor param to shape that can broadcast with input, with device/dtype matching."""
+    if isinstance(param, float):
+        if param < 0.0:
+            raise ValueError(f"{param_name} must be non-negative. Got {param}")
+        # Just use float, don't construct Tensor: broadcasting will take care
+        return param
+    if not isinstance(param, Tensor):
+        raise TypeError(f"The {param_name} should be a positive float or Tensor. Got {type(param)}")
+    if (param < 0.0).any():
+        raise ValueError(f"{param_name.capitalize()} must be non-negative. Got {param}")
+    # Permissively reshape only if needed (for broadcasting)
+    if param.shape == ():  # scalar Tensor
+        return param.to(dtype=input.dtype, device=input.device)
+    # Otherwise maybe (N,) with (N,...) input
+    in_shape = input.shape
+    p_shape = param.shape
+    if len(p_shape) < len(in_shape):
+        # Reshape to broadcast on batch dims
+        expand_shape = list(p_shape) + [1] * (len(in_shape) - len(p_shape))
+        return param.view(*expand_shape).to(dtype=input.dtype, device=input.device)
+    return param.to(dtype=input.dtype, device=input.device)
 
 
 class AdjustSaturation(Module):
