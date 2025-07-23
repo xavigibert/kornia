@@ -50,6 +50,12 @@ class PosterizeGenerator(RandomGeneratorBase):
         super().__init__()
         self.bits_factor = bits
 
+        # Cache the device to avoid repeated _extract_device_dtype cost if possible
+        if isinstance(bits, Tensor):
+            self._bits_device = bits.device
+        else:
+            self._bits_device = torch.device("cpu")
+
     def __repr__(self) -> str:
         repr = f"bits={self.bits_factor}"
         return repr
@@ -67,6 +73,21 @@ class PosterizeGenerator(RandomGeneratorBase):
     def forward(self, batch_shape: Tuple[int, ...], same_on_batch: bool = False) -> Dict[str, Tensor]:
         batch_size = batch_shape[0]
         _common_param_check(batch_size, same_on_batch)
-        _device, _ = _extract_device_dtype([self.bits_factor if isinstance(self.bits_factor, Tensor) else None])
+
+        # Fast-path for batch_size == 0
+        if batch_size == 0:
+            return {"bits_factor": torch.empty((0,), dtype=torch.int32, device=self._bits_device)}
+
+        # Precompute _device only if bits_factor is Tensor, else reuse cached value
+        if isinstance(self.bits_factor, Tensor):
+            _device, _ = _extract_device_dtype([self.bits_factor])
+        else:
+            _device = self._bits_device
+
         bits_factor = _adapted_rsampling((batch_size,), self.bit_sampler, same_on_batch)
-        return {"bits_factor": bits_factor.round().to(device=_device, dtype=torch.int32)}
+        bits_out = (
+            bits_factor.round().to(device=_device, dtype=torch.int32)
+            if (bits_factor.dtype != torch.int32 or bits_factor.device != _device)
+            else bits_factor
+        )
+        return {"bits_factor": bits_out}
