@@ -19,7 +19,7 @@
 
 import math
 from functools import partial
-from typing import Callable, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -66,18 +66,21 @@ class RANSAC(Module):
         max_lo_iters: int = 5,
     ) -> None:
         super().__init__()
-        self.supported_models = ["homography", "fundamental", "fundamental_7pt", "homography_from_linesegments"]
+        self.supported_models = [
+            "homography",
+            "fundamental",
+            "fundamental_7pt",
+            "homography_from_linesegments",
+        ]
         self.inl_th = inl_th
         self.max_iter = max_iter
         self.batch_size = batch_size
         self.model_type = model_type
         self.confidence = confidence
         self.max_lo_iters = max_lo_iters
-        self.model_type = model_type
 
-        self.error_fn: Callable[..., Tensor]
-        self.minimal_solver: Callable[..., Tensor]
-        self.polisher_solver: Callable[..., Tensor]
+        # Avoid double assignment
+        # self.model_type = model_type
 
         if model_type == "homography":
             self.error_fn = oneway_transfer_error
@@ -92,13 +95,13 @@ class RANSAC(Module):
         elif model_type == "fundamental":
             self.error_fn = symmetrical_epipolar_distance
             self.minimal_solver = find_fundamental
+            self.polisher_solver = find_fundamental  # Use 8-point by default
             self.minimal_sample_size = 8
-            self.polisher_solver = find_fundamental
         elif model_type == "fundamental_7pt":
             self.error_fn = symmetrical_epipolar_distance
             self.minimal_solver = partial(find_fundamental, method="7POINT")
+            self.polisher_solver = find_fundamental  # Use 8-point for polishing
             self.minimal_sample_size = 7
-            self.polisher_solver = find_fundamental
         else:
             raise NotImplementedError(f"{model_type} is unknown. Try one of {self.supported_models}")
 
@@ -154,11 +157,13 @@ class RANSAC(Module):
             return kp1[mask], kp2[mask]
         return kp1, kp2
 
+    @torch.jit.ignore
     def remove_bad_models(self, models: Tensor) -> Tensor:
         # ToDo: add more and better degenerate model rejection
         # For now it is simple and hardcoded
+        # use contiguous to avoid potential memory issues in diagonal for batched tensors
         main_diagonal = torch.diagonal(models, dim1=1, dim2=2)
-        mask = main_diagonal.abs().min(dim=1)[0] > 1e-4
+        mask = main_diagonal.abs().amin(dim=1) > 1e-4
         return models[mask]
 
     def polish_model(self, kp1: Tensor, kp2: Tensor, inliers: Tensor) -> Tensor:
