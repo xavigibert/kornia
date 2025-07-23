@@ -19,7 +19,7 @@
 
 import math
 from functools import partial
-from typing import Callable, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -66,6 +66,7 @@ class RANSAC(Module):
         max_lo_iters: int = 5,
     ) -> None:
         super().__init__()
+        # Store supported_models for error reporting only
         self.supported_models = ["homography", "fundamental", "fundamental_7pt", "homography_from_linesegments"]
         self.inl_th = inl_th
         self.max_iter = max_iter
@@ -73,34 +74,30 @@ class RANSAC(Module):
         self.model_type = model_type
         self.confidence = confidence
         self.max_lo_iters = max_lo_iters
-        self.model_type = model_type
 
-        self.error_fn: Callable[..., Tensor]
-        self.minimal_solver: Callable[..., Tensor]
-        self.polisher_solver: Callable[..., Tensor]
-
-        if model_type == "homography":
+        mt = model_type
+        if mt == "homography":
             self.error_fn = oneway_transfer_error
             self.minimal_solver = find_homography_dlt
             self.polisher_solver = find_homography_dlt_iterated
             self.minimal_sample_size = 4
-        elif model_type == "homography_from_linesegments":
+        elif mt == "homography_from_linesegments":
             self.error_fn = line_segment_transfer_error_one_way
             self.minimal_solver = find_homography_lines_dlt
             self.polisher_solver = find_homography_lines_dlt_iterated
             self.minimal_sample_size = 4
-        elif model_type == "fundamental":
+        elif mt == "fundamental":
             self.error_fn = symmetrical_epipolar_distance
             self.minimal_solver = find_fundamental
-            self.minimal_sample_size = 8
             self.polisher_solver = find_fundamental
-        elif model_type == "fundamental_7pt":
+            self.minimal_sample_size = 8
+        elif mt == "fundamental_7pt":
             self.error_fn = symmetrical_epipolar_distance
             self.minimal_solver = partial(find_fundamental, method="7POINT")
-            self.minimal_sample_size = 7
             self.polisher_solver = find_fundamental
+            self.minimal_sample_size = 7
         else:
-            raise NotImplementedError(f"{model_type} is unknown. Try one of {self.supported_models}")
+            raise NotImplementedError(f"{mt} is unknown. Try one of {self.supported_models}")
 
     def sample(self, sample_size: int, pop_size: int, batch_size: int, device: Optional[Device] = None) -> Tensor:
         """Minimal sampler, but unlike traditional RANSAC we sample in batches.
@@ -147,11 +144,13 @@ class RANSAC(Module):
         return model_best, inliers_best, best_model_score
 
     def remove_bad_samples(self, kp1: Tensor, kp2: Tensor) -> Tuple[Tensor, Tensor]:
-        # ToDo: add (model-specific) verification of the samples,
-        # E.g. constraints on not to be a degenerate sample
+        # Model-specific sample degeneracy filter. Optimized to avoid extra allocations if all are valid.
         if self.model_type == "homography":
             mask = sample_is_valid_for_homography(kp1, kp2)
+            if mask.all():
+                return kp1, kp2
             return kp1[mask], kp2[mask]
+        # Other models: no filter
         return kp1, kp2
 
     def remove_bad_models(self, models: Tensor) -> Tensor:
