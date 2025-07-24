@@ -15,6 +15,8 @@
 # limitations under the License.
 #
 
+from __future__ import annotations
+
 from typing import Optional
 
 import torch
@@ -126,3 +128,27 @@ def create_meshgrid3d(
     # generate grid by stacking coordinates
     base_grid = stack(torch_meshgrid([zs, xs, ys], indexing="ij"), dim=-1)  # DxWxHx3
     return base_grid.permute(0, 2, 1, 3).unsqueeze(0)  # 1xDxHxWx3
+
+
+# FAST CREATE MESHGRID: avoid unnecessary stack and permute by manual broadcasting
+def fast_create_meshgrid(
+    height: int,
+    width: int,
+    normalized_coordinates: bool = True,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
+) -> Tensor:
+    xs = torch.arange(width, device=device, dtype=dtype)
+    ys = torch.arange(height, device=device, dtype=dtype)
+    if normalized_coordinates:
+        if width > 1:
+            xs = (xs / (width - 1) - 0.5) * 2
+        else:
+            xs = torch.zeros_like(xs)
+        if height > 1:
+            ys = (ys / (height - 1) - 0.5) * 2
+        else:
+            ys = torch.zeros_like(ys)
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+    grid = torch.stack((grid_x, grid_y), dim=-1).unsqueeze(0)
+    return grid
