@@ -15,6 +15,8 @@
 # limitations under the License.
 #
 
+from __future__ import annotations
+
 from functools import wraps
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -288,19 +290,22 @@ def _adapted_rsampling(
     dist: torch.distributions.Distribution,
     same_on_batch: Optional[bool] = False,
 ) -> Tensor:
-    r"""Sample from a uniform reparameterized sampling function that accepts 'same_on_batch'.
+    """Sample from a uniform reparameterized sampling function that accepts 'same_on_batch'.
 
     If same_on_batch is True, all values generated will be exactly same given a batch_size (shape[0]). By default,
     same_on_batch is set to False.
     """
-    if isinstance(shape, tuple):
-        shape = torch.Size(shape)
-
+    # Fast path for already-Size, skip tuple/type checks
     if same_on_batch:
-        rsample_size = torch.Size((1, *shape[1:]))
-        rsample = dist.rsample(rsample_size)
-        return rsample.repeat(shape[0], *[1] * (len(rsample.shape) - 1))
-    return dist.rsample(shape)
+        batch_1_shape = (1, *shape[1:]) if isinstance(shape, tuple) else (1, *shape[1:])
+        rsample = dist.rsample(torch.Size(batch_1_shape))
+        # .repeat is fast if first dimension is batch, so avoid computing [1]*N
+        repeat_times = (shape[0],) + (1,) * (rsample.dim() - 1)
+        return rsample.repeat(*repeat_times)
+    else:
+        if isinstance(shape, tuple):
+            shape = torch.Size(shape)
+        return dist.rsample(shape)
 
 
 def _adapted_sampling(

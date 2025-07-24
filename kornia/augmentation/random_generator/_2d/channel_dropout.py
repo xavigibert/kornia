@@ -60,16 +60,18 @@ class ChannelDropoutGenerator(RandomGeneratorBase):
         self.drop_sampler = UniformDistribution(drop[0], drop[1], validate_args=False)
 
     def forward(self, batch_shape: tuple[int, ...], same_on_batch: bool = False) -> dict[str, Tensor]:
-        r"""Generate a mask for dropout channels."""
+        """Generate a mask for dropout channels."""
+        # Optimized generator for channel dropout masks
         batch_size, channels, _, _ = batch_shape
         _common_param_check(batch_size, same_on_batch)
-        _device, _dtype = self.device, self.dtype
-
-        batch_idx = torch.arange(batch_size, device=_device, dtype=torch.long).reshape(batch_size, 1)
-        channel_idx = torch.argsort(
-            _adapted_rsampling((batch_size, channels), self.drop_sampler, same_on_batch), dim=1
-        )[:, : self.num_drop_channels].to(torch.long)
-
+        _device = self.device
+        # batch_idx: use arange then unsqueeze instead of reshape
+        batch_idx = torch.arange(batch_size, device=_device, dtype=torch.long).unsqueeze(1)
+        # Sample mask, fast indexing/casting in single line
+        rand_mask = _adapted_rsampling((batch_size, channels), self.drop_sampler, same_on_batch)
+        channel_idx = torch.argsort(rand_mask, dim=1)[:, : self.num_drop_channels]
+        if channel_idx.dtype != torch.long:
+            channel_idx = channel_idx.to(torch.long)
         return {
             "batch_idx": batch_idx,
             "channel_idx": channel_idx,
