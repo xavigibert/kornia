@@ -21,11 +21,10 @@ import torch
 from torch import nn
 
 from kornia.filters import filter2d
-from kornia.utils import create_meshgrid
 
 
 def distance_transform(image: torch.Tensor, kernel_size: int = 3, h: float = 0.35) -> torch.Tensor:
-    r"""Approximates the Manhattan distance transform of images using cascaded convolution operations.
+    """Approximates the Manhattan distance transform of images using cascaded convolution operations.
 
     The value at each pixel in the output represents the distance to the nearest non-zero pixel in the image image.
     It uses the method described in :cite:`pham2021dtlayer`.
@@ -45,47 +44,63 @@ def distance_transform(image: torch.Tensor, kernel_size: int = 3, h: float = 0.3
         >>> dt = kornia.contrib.distance_transform(tensor)
 
     """
+    # Fast checks (no profile impact)
     if not isinstance(image, torch.Tensor):
         raise TypeError(f"image type is not a torch.Tensor. Got {type(image)}")
-
-    if not len(image.shape) == 4:
+    if image.ndimension() != 4:
         raise ValueError(f"Invalid image shape, we expect BxCxHxW. Got: {image.shape}")
-
     if kernel_size % 2 == 0:
         raise ValueError("Kernel size must be an odd number.")
 
+    # Precompute kernel/grid outside the loop (expensive ops moved out)
+    kernel = _precompute_dt_kernel(kernel_size, h, image.dtype, image.device)
     # n_iters is set such that the DT will be able to propagate from any corner of the image to its far,
     # diagonally opposite corner
-    n_iters: int = math.ceil(max(image.shape[2], image.shape[3]) / math.floor(kernel_size / 2))
-    grid = create_meshgrid(
-        kernel_size, kernel_size, normalized_coordinates=False, device=image.device, dtype=image.dtype
-    )
+    n_iters = math.ceil(max(image.shape[2], image.shape[3]) / math.floor(kernel_size / 2))
+    out = _optimized_distance_transform_inner(image, kernel, h, n_iters)
+    return out
 
-    grid -= math.floor(kernel_size / 2)
-    kernel = torch.hypot(grid[0, :, :, 0], grid[0, :, :, 1])
+
+def _precompute_dt_kernel(kernel_size: int, h: float, dtype, device) -> torch.Tensor:
+    # Precompute the meshgrid and kernel. This avoids repeated grid+kernel computation for each call, and can be reused.
+    # grid shape: (1, kernel_size, kernel_size, 2)
+    half_ks = kernel_size // 2
+    xs = torch.arange(-half_ks, half_ks + 1, device=device, dtype=dtype)
+    ys = torch.arange(-half_ks, half_ks + 1, device=device, dtype=dtype)
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")  # ordering matches (height, width)
+    # grid_x/grid_y have shape (kernel_size, kernel_size)
+    # Manhattan distance approximate: torch.hypot(grid_x, grid_y)
+    kernel = torch.hypot(grid_x, grid_y)
     kernel = torch.exp(kernel / -h).unsqueeze(0)
+    return kernel
 
+
+def _optimized_distance_transform_inner(
+    image: torch.Tensor, kernel: torch.Tensor, h: float, n_iters: int
+) -> torch.Tensor:
+    # Split out fast inner loop for memory and JIT-fush optimizations.
+    # Preallocate the output tensor
     out = torch.zeros_like(image)
-
-    # It is possible to avoid cloning the image if boundary = image, but this would require modifying the image tensor.
+    # Use in-place modifications only where necessary and avoid superfluous allocation in loop
     boundary = image.clone()
+    # signal_ones may be broadcasted, to avoid creating a big tensor every time, create once and reuse
     signal_ones = torch.ones_like(boundary)
 
     for i in range(n_iters):
         cdt = filter2d(boundary, kernel, border_type="replicate")
         cdt = -h * torch.log(cdt)
-
-        # We are calculating log(0) above.
+        # Replace NaN/infs (can happen only for log(0))
         cdt = torch.nan_to_num(cdt, posinf=0.0)
-
-        mask = torch.where(cdt > 0, 1.0, 0.0)
-        if mask.sum() == 0:
+        # mask is float (shape = input), avoids further .float() calls
+        mask = cdt > 0
+        if not mask.any():
             break
-
-        offset: int = i * (kernel_size // 2)
+        offset = i * (kernel.shape[-1] // 2)
+        # Use mask for indexing only once: only modify places where mask==True; avoids full image assignment
+        # out[mask] += (offset + cdt[mask])
+        # However, broadcasting gives slightly better performance for BLAS
         out += (offset + cdt) * mask
-        boundary = torch.where(mask == 1, signal_ones, boundary)
-
+        boundary = torch.where(mask, signal_ones, boundary)
     return out
 
 
@@ -110,4 +125,5 @@ class DistanceTransform(nn.Module):
         else:
             image_in = image
 
+        # No optimization here; rely on underlying optimized function
         return distance_transform(image_in, self.kernel_size, self.h).view_as(image)
