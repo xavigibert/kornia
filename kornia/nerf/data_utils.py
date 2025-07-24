@@ -177,7 +177,7 @@ class RayDataset(Dataset[RayGroup]):
 
 
 def instantiate_ray_dataloader(dataset: RayDataset, batch_size: int = 1, shuffle: bool = True) -> DataLoader[RayGroup]:
-    r"""Initialize a dataloader to manage a ray dataset.
+    """Initialize a dataloader to manage a ray dataset.
 
     Args:
         dataset: A ray dataset: RayDataset
@@ -185,18 +185,20 @@ def instantiate_ray_dataloader(dataset: RayDataset, batch_size: int = 1, shuffle
         shuffle: Whether to shuffle rays or sample then sequentially: bool
 
     """
-
-    def collate_rays(items: List[RayGroup]) -> RayGroup:
-        return items[0]
-
     if TYPE_CHECKING:
         # TODO: remove the type ignore when kornia relies on kornia 1.10
         return DataLoader(dataset)
     else:
+        # Avoid function nesting and minor overhead, instantiate sampler directly
+        base_sampler = RandomSampler(dataset) if shuffle else SequentialSampler(dataset)
+        batch_sampler = BatchSampler(base_sampler, batch_size, drop_last=False)
         return DataLoader(
             dataset,
-            sampler=BatchSampler(
-                RandomSampler(dataset) if shuffle else SequentialSampler(dataset), batch_size, drop_last=False
-            ),
-            collate_fn=collate_rays,
+            sampler=batch_sampler,
+            collate_fn=_fast_collate_rays,
         )
+
+
+def _fast_collate_rays(items: List["RayGroup"]) -> "RayGroup":
+    # Directly return the first item, bypassing call stack of nested def
+    return items[0]
