@@ -51,12 +51,10 @@ def get_grid_dict(patch_size: int = 32) -> Dict[str, Tensor]:
 
 
 def get_kron_order(d1: int, d2: int) -> Tensor:
-    r"""Get order for doing kronecker product."""
-    kron_order = zeros([d1 * d2, 2], dtype=torch.int64)
-    for i in range(d1):
-        for j in range(d2):
-            kron_order[i * d2 + j, 0] = i
-            kron_order[i * d2 + j, 1] = j
+    """Get order for doing kronecker product."""
+    idx0 = torch.arange(d1, dtype=torch.int64).repeat_interleave(d2)
+    idx1 = torch.arange(d2, dtype=torch.int64).repeat(d1)
+    kron_order = torch.stack((idx0, idx1), dim=1)
     return kron_order
 
 
@@ -234,8 +232,10 @@ class EmbedGradients(nn.Module):
 
 
 def spatial_kernel_embedding(kernel_type: str, grids: Dict[str, Tensor]) -> Tensor:
-    r"""Compute embeddings for cartesian and polar parametrizations."""
+    """Compute embeddings for cartesian and polar parametrizations."""
+    # These are all Python scalars and used for scaling, cheap to recompute
     factors = {"phi": 1.0, "rho": pi / sqrt2, "x": pi / 2, "y": pi / 2}
+
     if kernel_type == "cart":
         coeffs_ = "xy"
         params_ = ["x", "y"]
@@ -247,9 +247,8 @@ def spatial_kernel_embedding(kernel_type: str, grids: Dict[str, Tensor]) -> Tens
     keys = list(grids.keys())
     patch_size = grids[keys[0]].shape[-1]
 
-    # Scale appropriately.
-    grids_normed = {k: v * factors[k] for k, v in grids.items()}
-    grids_normed = {k: v.unsqueeze(0).unsqueeze(0).float() for k, v in grids_normed.items()}
+    # Combine norming and unsqueeze/float in a single comprehension for efficiency
+    grids_normed = {k: (v * factors[k]).unsqueeze(0).unsqueeze(0).float() for k, v in grids.items()}
 
     # x,y/rho,phi kernels.
     vm_a = VonMisesKernel(patch_size=patch_size, coeffs=COEFFS[coeffs_])
@@ -259,8 +258,10 @@ def spatial_kernel_embedding(kernel_type: str, grids: Dict[str, Tensor]) -> Tens
     emb_b = vm_b(grids_normed[params_[1]]).squeeze()
 
     # Final precomputed position embedding.
+    # kron_order now uses optimized get_kron_order
     kron_order = get_kron_order(vm_a.d, vm_b.d)
-    spatial_kernel = emb_a.index_select(0, kron_order[:, 0]) * emb_b.index_select(0, kron_order[:, 1])
+    # Index select using advanced indexing for improved efficiency
+    spatial_kernel = emb_a[kron_order[:, 0]] * emb_b[kron_order[:, 1]]
     return spatial_kernel
 
 
