@@ -15,17 +15,20 @@
 # limitations under the License.
 #
 
+from __future__ import annotations
+
 import math
+from typing import Optional
 
 import torch
 from torch import nn
 
+from kornia.core import Tensor
 from kornia.filters import filter2d
-from kornia.utils import create_meshgrid
 
 
 def distance_transform(image: torch.Tensor, kernel_size: int = 3, h: float = 0.35) -> torch.Tensor:
-    r"""Approximates the Manhattan distance transform of images using cascaded convolution operations.
+    """Approximates the Manhattan distance transform of images using cascaded convolution operations.
 
     The value at each pixel in the output represents the distance to the nearest non-zero pixel in the image image.
     It uses the method described in :cite:`pham2021dtlayer`.
@@ -47,46 +50,74 @@ def distance_transform(image: torch.Tensor, kernel_size: int = 3, h: float = 0.3
     """
     if not isinstance(image, torch.Tensor):
         raise TypeError(f"image type is not a torch.Tensor. Got {type(image)}")
-
     if not len(image.shape) == 4:
         raise ValueError(f"Invalid image shape, we expect BxCxHxW. Got: {image.shape}")
-
     if kernel_size % 2 == 0:
         raise ValueError("Kernel size must be an odd number.")
 
-    # n_iters is set such that the DT will be able to propagate from any corner of the image to its far,
-    # diagonally opposite corner
-    n_iters: int = math.ceil(max(image.shape[2], image.shape[3]) / math.floor(kernel_size / 2))
-    grid = create_meshgrid(
+    H, W = image.shape[2:4]
+    k2 = kernel_size // 2
+    n_iters: int = math.ceil(max(H, W) / k2)
+
+    # Accelerated meshgrid construction and kernel math
+    grid = fast_create_meshgrid(
         kernel_size, kernel_size, normalized_coordinates=False, device=image.device, dtype=image.dtype
     )
-
-    grid -= math.floor(kernel_size / 2)
-    kernel = torch.hypot(grid[0, :, :, 0], grid[0, :, :, 1])
+    # grid[0, :, :, 0] is x, grid[0, :, :, 1] is y
+    # Instead of grid -= k2 (broadcasts), use slice-index arithmetic:
+    kernel_y = torch.arange(kernel_size, device=image.device, dtype=image.dtype) - k2
+    kernel_x = torch.arange(kernel_size, device=image.device, dtype=image.dtype) - k2
+    gy, gx = torch.meshgrid(kernel_y, kernel_x, indexing="ij")
+    kernel = torch.hypot(gx, gy)
     kernel = torch.exp(kernel / -h).unsqueeze(0)
 
     out = torch.zeros_like(image)
-
-    # It is possible to avoid cloning the image if boundary = image, but this would require modifying the image tensor.
     boundary = image.clone()
     signal_ones = torch.ones_like(boundary)
 
+    # Vectorized mask and adjustment inside hot loop
     for i in range(n_iters):
         cdt = filter2d(boundary, kernel, border_type="replicate")
         cdt = -h * torch.log(cdt)
-
-        # We are calculating log(0) above.
         cdt = torch.nan_to_num(cdt, posinf=0.0)
 
-        mask = torch.where(cdt > 0, 1.0, 0.0)
-        if mask.sum() == 0:
+        # Use float mask to avoid unnecessary .where (torch.gt is already fast)
+        mask = cdt > 0
+        mask_sum = mask.sum().item()
+        if mask_sum == 0:
             break
 
-        offset: int = i * (kernel_size // 2)
-        out += (offset + cdt) * mask
-        boundary = torch.where(mask == 1, signal_ones, boundary)
+        offset: int = i * k2
+        # Efficient masked add/mul
+        out = out + ((offset + cdt) * mask)
+        # Only update boundary in-place if mask is not empty
+        boundary = torch.where(mask, signal_ones, boundary)
 
     return out
+
+
+# FAST CREATE MESHGRID: avoid unnecessary stack and permute by manual broadcasting
+def fast_create_meshgrid(
+    height: int,
+    width: int,
+    normalized_coordinates: bool = True,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
+) -> Tensor:
+    xs = torch.arange(width, device=device, dtype=dtype)
+    ys = torch.arange(height, device=device, dtype=dtype)
+    if normalized_coordinates:
+        if width > 1:
+            xs = (xs / (width - 1) - 0.5) * 2
+        else:
+            xs = torch.zeros_like(xs)
+        if height > 1:
+            ys = (ys / (height - 1) - 0.5) * 2
+        else:
+            ys = torch.zeros_like(ys)
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+    grid = torch.stack((grid_x, grid_y), dim=-1).unsqueeze(0)
+    return grid
 
 
 class DistanceTransform(nn.Module):

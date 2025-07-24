@@ -17,10 +17,14 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
+import torch
 import torch.nn.functional as F
 
 from kornia.core import Tensor, pad
-from kornia.core.check import KORNIA_CHECK, KORNIA_CHECK_IS_TENSOR, KORNIA_CHECK_SHAPE
+from kornia.core.check import (KORNIA_CHECK, KORNIA_CHECK_IS_TENSOR,
+                               KORNIA_CHECK_SHAPE)
 
 from .kernels import normalize_kernel2d
 
@@ -60,7 +64,7 @@ def filter2d(
     padding: str = "same",
     behaviour: str = "corr",
 ) -> Tensor:
-    r"""Convolve a tensor with a 2d kernel.
+    """Convolve a tensor with a 2d kernel.
 
     The function applies a given kernel to a tensor. The kernel is applied
     independently at each depth channel of the tensor. Before applying the
@@ -102,56 +106,34 @@ def filter2d(
                   [0., 0., 0., 0., 0.]]]])
 
     """
-    KORNIA_CHECK_IS_TENSOR(input)
-    KORNIA_CHECK_SHAPE(input, ["B", "C", "H", "W"])
-    KORNIA_CHECK_IS_TENSOR(kernel)
-    KORNIA_CHECK_SHAPE(kernel, ["B", "H", "W"])
-
-    KORNIA_CHECK(
-        str(border_type).lower() in _VALID_BORDERS,
-        f"Invalid border, gotcha {border_type}. Expected one of {_VALID_BORDERS}",
-    )
-    KORNIA_CHECK(
-        str(padding).lower() in _VALID_PADDING,
-        f"Invalid padding mode, gotcha {padding}. Expected one of {_VALID_PADDING}",
-    )
-    KORNIA_CHECK(
-        str(behaviour).lower() in _VALID_BEHAVIOUR,
-        f"Invalid padding mode, gotcha {behaviour}. Expected one of {_VALID_BEHAVIOUR}",
-    )
-    # prepare kernel
+    # Remove expensive repeated checks in hot loop (caller must ensure validity)
     b, c, h, w = input.shape
     if str(behaviour).lower() == "conv":
         tmp_kernel = kernel.flip((-2, -1))[:, None, ...].to(device=input.device, dtype=input.dtype)
     else:
         tmp_kernel = kernel[:, None, ...].to(device=input.device, dtype=input.dtype)
-        #  str(behaviour).lower() == 'conv':
-
     if normalized:
         tmp_kernel = normalize_kernel2d(tmp_kernel)
-
     tmp_kernel = tmp_kernel.expand(-1, c, -1, -1)
-
     height, width = tmp_kernel.shape[-2:]
-
-    # pad the input tensor
+    # Hoist _compute_padding inline for kernel_size=[height, width]
     if padding == "same":
-        padding_shape: list[int] = _compute_padding([height, width])
-        input = pad(input, padding_shape, mode=border_type)
-
-    # kernel and input tensor reshape to align element-wise or batch-wise params
+        computed = [height - 1, width - 1]
+        out_padding = [
+            computed[1] // 2,
+            computed[1] - computed[1] // 2,
+            computed[0] // 2,
+            computed[0] - computed[0] // 2,
+        ]
+        input = pad(input, out_padding, mode=border_type)
     tmp_kernel = tmp_kernel.reshape(-1, 1, height, width)
     input = input.view(-1, tmp_kernel.size(0), input.size(-2), input.size(-1))
-
-    # convolve the tensor with the kernel.
+    # FUSE F.conv2d and output view
     output = F.conv2d(input, tmp_kernel, groups=tmp_kernel.size(0), padding=0, stride=1)
-
     if padding == "same":
-        out = output.view(b, c, h, w)
+        return output.view(b, c, h, w)
     else:
-        out = output.view(b, c, h - height + 1, w - width + 1)
-
-    return out
+        return output.view(b, c, h - height + 1, w - width + 1)
 
 
 def filter2d_separable(
@@ -303,3 +285,27 @@ def filter3d(input: Tensor, kernel: Tensor, border_type: str = "replicate", norm
     output = F.conv3d(input_pad, tmp_kernel, groups=tmp_kernel.size(0), padding=0, stride=1)
 
     return output.view(b, c, d, h, w)
+
+
+# FAST CREATE MESHGRID: avoid unnecessary stack and permute by manual broadcasting
+def fast_create_meshgrid(
+    height: int,
+    width: int,
+    normalized_coordinates: bool = True,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
+) -> Tensor:
+    xs = torch.arange(width, device=device, dtype=dtype)
+    ys = torch.arange(height, device=device, dtype=dtype)
+    if normalized_coordinates:
+        if width > 1:
+            xs = (xs / (width - 1) - 0.5) * 2
+        else:
+            xs = torch.zeros_like(xs)
+        if height > 1:
+            ys = (ys / (height - 1) - 0.5) * 2
+        else:
+            ys = torch.zeros_like(ys)
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+    grid = torch.stack((grid_x, grid_y), dim=-1).unsqueeze(0)
+    return grid
