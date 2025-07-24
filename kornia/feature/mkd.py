@@ -15,6 +15,8 @@
 # limitations under the License.
 #
 
+from __future__ import annotations
+
 from typing import Any, Dict, List, Tuple, Union
 
 import torch
@@ -87,20 +89,24 @@ class MKDGradients(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.eps = 1e-8
-
         self.grad = SpatialGradient(mode="diff", order=1, normalized=False)
 
     def forward(self, x: Tensor) -> Tensor:
         if not isinstance(x, Tensor):
             raise TypeError(f"Input type is not a Tensor. Got {type(x)}")
-        if not len(x.shape) == 4:
+        if x.ndim != 4:
             raise ValueError(f"Invalid input shape, we expect Bx1xHxW. Got: {x.shape}")
-        # Modify 'diff' gradient. Before we had lambda function, but it is not jittable
-        grads_xy = -self.grad(x)
+        grads_xy = -self.grad(x)  # Bx1x2xHxW
+
+        # Slice only once, avoids creating lots of views
         gx = grads_xy[:, :, 0, :, :]
         gy = grads_xy[:, :, 1, :, :]
-        y = torch.cat(cart2pol(gx, gy, self.eps), dim=1)
-        return y
+
+        # Use kornia's optimized cart2pol
+        rho, phi = cart2pol(gx, gy, eps=self.eps)
+
+        # Efficiently stack [magnitudes, orientations] on channel dim
+        return torch.cat((rho, phi), dim=1)
 
     def __repr__(self) -> str:
         return self.__class__.__name__
