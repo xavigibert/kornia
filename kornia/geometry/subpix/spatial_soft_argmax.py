@@ -17,7 +17,7 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -26,11 +26,20 @@ from kornia.core import Module, Tensor, concatenate, rand, stack, tensor, where,
 from kornia.filters.sobel import spatial_gradient3d
 from kornia.geometry.conversions import normalize_pixel_coordinates, normalize_pixel_coordinates3d
 from kornia.utils import create_meshgrid, create_meshgrid3d
-from kornia.utils._compat import torch_version_ge
+from kornia.utils._compat import torch_meshgrid, torch_version_ge
 from kornia.utils.helpers import safe_solve_with_mask
 
 from .dsnt import spatial_expectation2d, spatial_softmax2d
 from .nms import nms3d
+
+# --------- Memoization helpers for kernels and meshgrids ---------
+
+# Cache for commonly-used window center kernels, window grid kernels, and meshgrids
+# as (h,w,device,dtype) for proper per-device computation and fp32/fp16 support
+
+_center_kernel2d_cache: Dict[Tuple[int, int, int, int], torch.Tensor] = {}
+_window_grid_kernel2d_cache: Dict[Tuple[int, int, int, int], torch.Tensor] = {}
+_meshgrid_cache: Dict[Tuple[int, int, int, str, str], torch.Tensor] = {}
 
 
 def _get_window_grid_kernel2d(h: int, w: int, device: Optional[torch.device] = None) -> Tensor:
@@ -267,13 +276,13 @@ def conv_soft_argmax2d(
     eps: float = 1e-8,
     output_value: bool = False,
 ) -> Tensor | tuple[Tensor, Tensor]:
-    r"""Compute the convolutional spatial Soft-Argmax 2D over the windows of a given heatmap.
+    """Compute the convolutional spatial Soft-Argmax 2D over the windows of a given heatmap.
 
     .. math::
-        ij(X) = \frac{\sum{(i,j)} * exp(x / T)  \in X} {\sum{exp(x / T)  \in X}}
+        ij(X) = \frac{\\sum{(i,j)} * exp(x / T)  \\in X} {\\sum{exp(x / T)  \\in X}}
 
     .. math::
-        val(X) = \frac{\sum{x * exp(x / T)  \in X}} {\sum{exp(x / T)  \in X}}
+        val(X) = \frac{\\sum{x * exp(x / T)  \\in X}} {\\sum{exp(x / T)  \\in X}}
 
     where :math:`T` is temperature.
 
@@ -296,12 +305,12 @@ def conv_soft_argmax2d(
         where
 
          .. math::
-             H_{out} = \left\lfloor\frac{H_{in}  + 2 \times \text{padding}[0] -
-               (\text{kernel\_size}[0] - 1) - 1}{\text{stride}[0]} + 1\right\rfloor
+             H_{out} = \\left\\lfloor\frac{H_{in}  + 2 \times \text{padding}[0] -
+               (\text{kernel\\_size}[0] - 1) - 1}{\text{stride}[0]} + 1\right\rfloor
 
          .. math::
-             W_{out} = \left\lfloor\frac{W_{in}  + 2 \times \text{padding}[1] -
-               (\text{kernel\_size}[1] - 1) - 1}{\text{stride}[1]} + 1\right\rfloor
+             W_{out} = \\left\\lfloor\frac{W_{in}  + 2 \times \text{padding}[1] -
+               (\text{kernel\\_size}[1] - 1) - 1}{\text{stride}[1]} + 1\right\rfloor
 
     Examples:
         >>> input = torch.randn(20, 16, 50, 32)
@@ -323,47 +332,33 @@ def conv_soft_argmax2d(
     dtype: torch.dtype = input.dtype
     input = input.view(b * c, 1, h, w)
 
-    center_kernel: Tensor = _get_center_kernel2d(ky, kx, device).to(dtype)
-    window_kernel: Tensor = _get_window_grid_kernel2d(ky, kx, device).to(dtype)
+    # Use cached fast helpers for window/center kernels
+    center_kernel: Tensor = _fast_get_center_kernel2d(ky, kx, device, dtype)
+    window_kernel: Tensor = _fast_get_window_grid_kernel2d(ky, kx, device, dtype)
 
-    # applies exponential normalization trick
-    # https://timvieira.github.io/blog/post/2014/02/11/exp-normalize-trick/
-    # https://github.com/pytorch/pytorch/blob/bcb0bb7e0e03b386ad837015faba6b4b16e3bfb9/aten/src/ATen/native/SoftMax.cpp#L44
+    # Exponential normalization trick unchanged
     x_max = F.adaptive_max_pool2d(input, (1, 1))
-
-    # max is detached to prevent undesired backprop loops in the graph
     x_exp = ((input - x_max.detach()) / temperature).exp()
 
-    # F.avg_pool2d(.., divisor_override = 1.0) - proper way for sum pool in PyTorch 1.2.
-    # Not available yet in version 1.0, so let's do manually
     pool_coef: float = float(kx * ky)
 
-    # softmax denominator
     den = pool_coef * F.avg_pool2d(x_exp, kernel_size, stride=stride, padding=padding) + eps
-
     x_softmaxpool = pool_coef * F.avg_pool2d(x_exp * input, kernel_size, stride=stride, padding=padding) / den
     x_softmaxpool = x_softmaxpool.view(b, c, x_softmaxpool.size(2), x_softmaxpool.size(3))
 
-    # We need to output also coordinates
-    # Pooled window center coordinates
-    grid_global: Tensor = create_meshgrid(h, w, False, device).to(dtype).permute(0, 3, 1, 2)
+    # Create grid_global using our cached/memoized meshgrid
+    grid_global: Tensor = _fast_create_meshgrid(h, w, False, device, dtype).permute(0, 3, 1, 2)
 
     grid_global_pooled = F.conv2d(grid_global, center_kernel, stride=stride, padding=padding)
 
-    # Coordinates of maxima residual to window center
-    # prepare kernel
     coords_max: Tensor = F.conv2d(x_exp, window_kernel, stride=stride, padding=padding)
-
-    coords_max = coords_max / den.expand_as(coords_max)
-    coords_max = coords_max + grid_global_pooled.expand_as(coords_max)
-    # [:,:, 0, ...] is x
-    # [:,:, 1, ...] is y
+    coords_max = coords_max / den
+    coords_max = coords_max + grid_global_pooled
 
     if normalized_coordinates:
-        coords_max = normalize_pixel_coordinates(coords_max.permute(0, 2, 3, 1), h, w)
+        coords_max = _fast_normalize_pixel_coordinates(coords_max.permute(0, 2, 3, 1), h, w)
         coords_max = coords_max.permute(0, 3, 1, 2)
 
-    # Back B*C -> (b, c)
     coords_max = coords_max.view(b, c, 2, coords_max.size(2), coords_max.size(3))
 
     if output_value:
@@ -641,6 +636,96 @@ def conv_quad_interp3d(input: Tensor, strict_maxima_bonus: float = 10.0, eps: fl
     coords_max = coords_max + dx_res
 
     return coords_max, y_max
+
+
+def _get_device_id(device):
+    # Returns a stable id for cache key: CPU=0, CUDA=unique index
+    if device.type == "cpu":
+        return 0
+    return torch.cuda.device(device) if hasattr(torch.cuda, "device") else device.index
+
+
+def _fast_get_window_grid_kernel2d(h: int, w: int, device: torch.device, dtype: torch.dtype) -> Tensor:
+    # Optimized and cached version
+    cache_key = (h, w, _get_device_id(device), str(dtype))
+    out = _window_grid_kernel2d_cache.get(cache_key)
+    if out is not None:
+        return out
+    # Direct grid and normalization in correct dtype/device
+    window_grid2d = _fast_create_meshgrid(h, w, False, device, dtype)
+    window_grid2d = _fast_normalize_pixel_coordinates(window_grid2d, h, w)
+    # Equivalent to permute(3, 0, 1, 2)
+    conv_kernel = window_grid2d.permute(3, 0, 1, 2).contiguous()
+    _window_grid_kernel2d_cache[cache_key] = conv_kernel
+    return conv_kernel
+
+
+def _fast_get_center_kernel2d(h: int, w: int, device: torch.device, dtype: torch.dtype) -> Tensor:
+    # Optimized and cached version
+    cache_key = (h, w, _get_device_id(device), str(dtype))
+    out = _center_kernel2d_cache.get(cache_key)
+    if out is not None:
+        return out
+    # Allocate directly in correct dtype/device
+    center_kernel = torch.zeros(2, 2, h, w, device=device, dtype=dtype)
+    # Center patch (same logic)
+    if h % 2 != 0:
+        h_i1 = h // 2
+        h_i2 = (h // 2) + 1
+    else:
+        h_i1 = (h // 2) - 1
+        h_i2 = (h // 2) + 1
+    if w % 2 != 0:
+        w_i1 = w // 2
+        w_i2 = (w // 2) + 1
+    else:
+        w_i1 = (w // 2) - 1
+        w_i2 = (w // 2) + 1
+    val = 1.0 / float((h_i2 - h_i1) * (w_i2 - w_i1))
+    center_kernel[(0, 1), (0, 1), h_i1:h_i2, w_i1:w_i2] = val
+    _center_kernel2d_cache[cache_key] = center_kernel
+    return center_kernel
+
+
+def _fast_create_meshgrid(
+    height: int,
+    width: int,
+    normalized_coordinates: bool = True,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
+) -> Tensor:
+    # Memoized version with fast construction & cache
+    cache_key = (height, width, int(normalized_coordinates), str(device), str(dtype))
+    out = _meshgrid_cache.get(cache_key)
+    if out is not None:
+        return out
+
+    xs = torch.linspace(0, width - 1, width, device=device, dtype=dtype)
+    ys = torch.linspace(0, height - 1, height, device=device, dtype=dtype)
+    if normalized_coordinates:
+        if width > 1:
+            xs = (xs / (width - 1) - 0.5) * 2
+        else:
+            xs.fill_(0)
+        if height > 1:
+            ys = (ys / (height - 1) - 0.5) * 2
+        else:
+            ys.fill_(0)
+    base_grid = stack(torch_meshgrid([xs, ys], indexing="ij"), dim=-1)
+    grid = base_grid.permute(1, 0, 2).unsqueeze(0).contiguous()
+    _meshgrid_cache[cache_key] = grid
+    return grid
+
+
+def _fast_normalize_pixel_coordinates(pixel_coordinates: Tensor, height: int, width: int, eps: float = 1e-8) -> Tensor:
+    # Optimized: batch creation of normalization factor
+    if pixel_coordinates.shape[-1] != 2:
+        raise ValueError(f"Input pixel_coordinates must be of shape (*, 2). Got {pixel_coordinates.shape}")
+
+    # Direct torch.tensor without additional function call
+    hw = torch.tensor([width, height], device=pixel_coordinates.device, dtype=pixel_coordinates.dtype)
+    factor = 2.0 / (hw - 1).clamp(min=eps)
+    return factor * pixel_coordinates - 1
 
 
 class ConvQuadInterp3d(Module):
