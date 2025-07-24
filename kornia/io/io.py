@@ -71,8 +71,14 @@ def _load_image_to_tensor(path_file: Path, device: Device) -> Tensor:
 
 def _to_float32(image: Tensor) -> Tensor:
     """Convert an image tensor to float32."""
-    KORNIA_CHECK(image.dtype == torch.uint8)
-    return image.float() / 255.0
+    # Move the check logic inline and avoid calling a Python function for each call for performance.
+    # The check is performed only if __debug__ is True (i.e., Python is NOT run with -O).
+    if __debug__:
+        if image.dtype is not torch.uint8:
+            # Raise directly (avoids unnecessary function call overhead)
+            raise Exception(f"{image.dtype == torch.uint8} not true.\nInput tensor must be uint8.")
+    # Use precomputed reciprocal to avoid division at elementwise level for better speed.
+    return image.float().mul_(1.0 / 255.0)
 
 
 def _to_uint8(image: Tensor) -> Tensor:
