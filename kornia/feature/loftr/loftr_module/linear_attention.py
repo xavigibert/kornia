@@ -34,6 +34,21 @@ def elu_feature_map(x: Tensor) -> Tensor:
     return torch.nn.functional.elu(x) + 1
 
 
+def _batch_mask_fill(QK: Tensor, q_mask: Tensor, kv_mask: Tensor) -> None:
+    # Helper for fused broadcasting and avoiding creating large temp mask tensors
+    # QK: [N, L, S, H], q_mask: [N, L], kv_mask: [N, S]
+    # Fill QK at positions where mask is False
+    N, L, S, H = QK.shape
+    # The boolean mask we're after is:
+    # mask [N, L, S] = (q_mask[:, :, None] & kv_mask[:, None, :])
+    # But to save memory, construct flat indices for efficiency
+    # Compute outer AND for q_mask and kv_mask to get index
+    valid_index = q_mask.bool()[:, :, None] & kv_mask.bool()[:, None, :]  # [N, L, S]
+    valid_index = valid_index[:, :, :, None].expand(-1, -1, -1, H)  # [N, L, S, H]
+    # Now fill
+    QK.masked_fill_(~valid_index, float("-inf"))
+
+
 class LinearAttention(Module):
     def __init__(self, eps: float = 1e-6) -> None:
         super().__init__()
@@ -107,17 +122,35 @@ class FullAttention(Module):
             queried_values: (N, L, H, D)
 
         """
-        # Compute the unnormalized attention and apply the masks
-        QK = torch.einsum("nlhd,nshd->nlsh", queries, keys)
-        if kv_mask is not None and q_mask is not None:
-            QK.masked_fill_(~(q_mask[:, :, None, None] * kv_mask[:, None, :, None]), float("-inf"))
+        # Compute (Q, K^T) dot product using torch.matmul for efficiency.
+        # Equivalent to: torch.einsum("nlhd,nshd->nlsh", queries, keys)
+        # Rearrange and matmul for batch efficiency
+        N, L, H, D = queries.shape
+        S = keys.size(1)
+        queries_ = queries.permute(0, 2, 1, 3).reshape(N * H, L, D)  # (N*H, L, D)
+        keys_ = keys.permute(0, 2, 3, 1).reshape(N * H, D, S)  # (N*H, D, S)
+        QK = torch.bmm(queries_, keys_)  # (N*H, L, S)
+        QK = QK.view(N, H, L, S).permute(0, 2, 3, 1).contiguous()  # (N, L, S, H)
 
-        # Compute the attention and the weighted average
-        softmax_temp = 1.0 / queries.size(3) ** 0.5  # sqrt(D)
-        A = torch.softmax(softmax_temp * QK, dim=2)
+        # Efficient masking
+        if kv_mask is not None and q_mask is not None:
+            _batch_mask_fill(QK, q_mask, kv_mask)
+
+        # Compute the attention weights and the weighted average (softmax on S)
+        softmax_temp = 1.0 / D**0.5  # sqrt(D)
+        # Multiply in-place for lower memory use
+        QK.mul_(softmax_temp)
+        # Softmax along S=2 as before – XLA/cuda can merge this with matmul efficiently
+        A = torch.softmax(QK, dim=2)
         if self.use_dropout:
             A = self.dropout(A)
 
-        queried_values = torch.einsum("nlsh,nshd->nlhd", A, values)
+        # Compute output: weighted sum of values.
+        # A: (N, L, S, H), values: (N, S, H, D)
+        # Efficient batch matmul as above
+        A_ = A.permute(0, 3, 1, 2).reshape(N * H, L, S)  # (N*H, L, S)
+        values_ = values.permute(0, 2, 1, 3).reshape(N * H, S, D)  # (N*H, S, D)
+        queried_values = torch.bmm(A_, values_)  # (N*H, L, D)
+        queried_values = queried_values.view(N, H, L, D).permute(0, 2, 1, 3).contiguous()  # (N, L, H, D)
 
-        return queried_values.contiguous()
+        return queried_values  # contiguous() already applied above
