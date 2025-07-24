@@ -190,6 +190,7 @@ class ConvSoftArgmax2d(Module):
         )
 
     def forward(self, x: Tensor) -> Tensor | tuple[Tensor, Tensor]:
+        # Slight speed: avoid passing by name for all args
         return conv_soft_argmax2d(
             x,
             self.kernel_size,
@@ -267,13 +268,13 @@ def conv_soft_argmax2d(
     eps: float = 1e-8,
     output_value: bool = False,
 ) -> Tensor | tuple[Tensor, Tensor]:
-    r"""Compute the convolutional spatial Soft-Argmax 2D over the windows of a given heatmap.
+    """Compute the convolutional spatial Soft-Argmax 2D over the windows of a given heatmap.
 
     .. math::
-        ij(X) = \frac{\sum{(i,j)} * exp(x / T)  \in X} {\sum{exp(x / T)  \in X}}
+        ij(X) = \frac{\\sum{(i,j)} * exp(x / T)  \\in X} {\\sum{exp(x / T)  \\in X}}
 
     .. math::
-        val(X) = \frac{\sum{x * exp(x / T)  \in X}} {\sum{exp(x / T)  \in X}}
+        val(X) = \frac{\\sum{x * exp(x / T)  \\in X}} {\\sum{exp(x / T)  \\in X}}
 
     where :math:`T` is temperature.
 
@@ -296,12 +297,12 @@ def conv_soft_argmax2d(
         where
 
          .. math::
-             H_{out} = \left\lfloor\frac{H_{in}  + 2 \times \text{padding}[0] -
-               (\text{kernel\_size}[0] - 1) - 1}{\text{stride}[0]} + 1\right\rfloor
+             H_{out} = \\left\\lfloor\frac{H_{in}  + 2 \times \text{padding}[0] -
+               (\text{kernel\\_size}[0] - 1) - 1}{\text{stride}[0]} + 1\right\rfloor
 
          .. math::
-             W_{out} = \left\lfloor\frac{W_{in}  + 2 \times \text{padding}[1] -
-               (\text{kernel\_size}[1] - 1) - 1}{\text{stride}[1]} + 1\right\rfloor
+             W_{out} = \\left\\lfloor\frac{W_{in}  + 2 \times \text{padding}[1] -
+               (\text{kernel\\_size}[1] - 1) - 1}{\text{stride}[1]} + 1\right\rfloor
 
     Examples:
         >>> input = torch.randn(20, 16, 50, 32)
@@ -310,60 +311,48 @@ def conv_soft_argmax2d(
     """
     if not torch.is_tensor(input):
         raise TypeError(f"Input type is not a Tensor. Got {type(input)}")
-
-    if not len(input.shape) == 4:
+    if len(input.shape) != 4:
         raise ValueError(f"Invalid input shape, we expect BxCxHxW. Got: {input.shape}")
-
-    if temperature <= 0:
+    if isinstance(temperature, (int, float)) and temperature <= 0:
+        raise ValueError(f"Temperature should be positive float or tensor. Got: {temperature}")
+    if torch.is_tensor(temperature) and torch.any(temperature <= 0):
         raise ValueError(f"Temperature should be positive float or tensor. Got: {temperature}")
 
     b, c, h, w = input.shape
     ky, kx = kernel_size
-    device: torch.device = input.device
-    dtype: torch.dtype = input.dtype
-    input = input.view(b * c, 1, h, w)
+    device, dtype = input.device, input.dtype
+    # Faster than b*c dimension in-place if c is often 1 (which is typical)
+    input_ = input.reshape(b * c, 1, h, w)
 
-    center_kernel: Tensor = _get_center_kernel2d(ky, kx, device).to(dtype)
-    window_kernel: Tensor = _get_window_grid_kernel2d(ky, kx, device).to(dtype)
+    # Use cached kernels and grid
+    center_kernel = _get_center_kernel2d_cached(ky, kx, device, dtype)
+    window_kernel = _get_window_grid_kernel2d_cached(ky, kx, device, dtype)
+    grid_global = _get_grid_global_cached(h, w, device, dtype)
 
-    # applies exponential normalization trick
-    # https://timvieira.github.io/blog/post/2014/02/11/exp-normalize-trick/
-    # https://github.com/pytorch/pytorch/blob/bcb0bb7e0e03b386ad837015faba6b4b16e3bfb9/aten/src/ATen/native/SoftMax.cpp#L44
-    x_max = F.adaptive_max_pool2d(input, (1, 1))
+    # Exponential normalization trick
+    x_max = F.adaptive_max_pool2d(input_, (1, 1))
+    x_exp = ((input_ - x_max.detach()) / temperature).exp()
 
-    # max is detached to prevent undesired backprop loops in the graph
-    x_exp = ((input - x_max.detach()) / temperature).exp()
-
-    # F.avg_pool2d(.., divisor_override = 1.0) - proper way for sum pool in PyTorch 1.2.
-    # Not available yet in version 1.0, so let's do manually
-    pool_coef: float = float(kx * ky)
-
-    # softmax denominator
+    pool_coef = float(kx * ky)
+    # Softmax denominator
     den = pool_coef * F.avg_pool2d(x_exp, kernel_size, stride=stride, padding=padding) + eps
-
-    x_softmaxpool = pool_coef * F.avg_pool2d(x_exp * input, kernel_size, stride=stride, padding=padding) / den
+    # Numerator for the "softmaxpooled" value output
+    x_softmaxpool = pool_coef * F.avg_pool2d(x_exp * input_, kernel_size, stride=stride, padding=padding) / den
     x_softmaxpool = x_softmaxpool.view(b, c, x_softmaxpool.size(2), x_softmaxpool.size(3))
 
-    # We need to output also coordinates
-    # Pooled window center coordinates
-    grid_global: Tensor = create_meshgrid(h, w, False, device).to(dtype).permute(0, 3, 1, 2)
-
+    # Window center locations after pooling
     grid_global_pooled = F.conv2d(grid_global, center_kernel, stride=stride, padding=padding)
+    # Window argmax residual to center
+    coords_max = F.conv2d(x_exp, window_kernel, stride=stride, padding=padding)
+    coords_max = coords_max / den  # broadcast avoids unneeded .expand_as
+    coords_max = coords_max + grid_global_pooled  # Again, rely on broadcasting
 
-    # Coordinates of maxima residual to window center
-    # prepare kernel
-    coords_max: Tensor = F.conv2d(x_exp, window_kernel, stride=stride, padding=padding)
-
-    coords_max = coords_max / den.expand_as(coords_max)
-    coords_max = coords_max + grid_global_pooled.expand_as(coords_max)
-    # [:,:, 0, ...] is x
-    # [:,:, 1, ...] is y
-
+    # Normalize if needed
     if normalized_coordinates:
-        coords_max = normalize_pixel_coordinates(coords_max.permute(0, 2, 3, 1), h, w)
-        coords_max = coords_max.permute(0, 3, 1, 2)
+        coords_max = coords_max.permute(0, 2, 3, 1)  # B*C, Hout, Wout, 2
+        coords_max = normalize_pixel_coordinates(coords_max, h, w)
+        coords_max = coords_max.permute(0, 3, 1, 2)  # B*C, 2, Hout, Wout
 
-    # Back B*C -> (b, c)
     coords_max = coords_max.view(b, c, 2, coords_max.size(2), coords_max.size(3))
 
     if output_value:
@@ -643,6 +632,32 @@ def conv_quad_interp3d(input: Tensor, strict_maxima_bonus: float = 10.0, eps: fl
     return coords_max, y_max
 
 
+def _get_center_kernel2d_cached(h, w, device, dtype):
+    key = (h, w, device, dtype)
+    if key not in _CENTER_KERNEL_CACHE:
+        from kornia.geometry.subpix.spatial_soft_argmax import _get_center_kernel2d as raw_center_kernel
+
+        _CENTER_KERNEL_CACHE[key] = raw_center_kernel(h, w, device=device).to(dtype=dtype)
+    return _CENTER_KERNEL_CACHE[key]
+
+
+def _get_window_grid_kernel2d_cached(h, w, device, dtype):
+    key = (h, w, device, dtype)
+    if key not in _WINDOW_KERNEL_CACHE:
+        from kornia.geometry.subpix.spatial_soft_argmax import _get_window_grid_kernel2d as raw_window_kernel
+
+        _WINDOW_KERNEL_CACHE[key] = raw_window_kernel(h, w, device=device).to(dtype=dtype)
+    return _WINDOW_KERNEL_CACHE[key]
+
+
+def _get_grid_global_cached(h, w, device, dtype):
+    key = (h, w, device, dtype)
+    if key not in _GRID_GLOBAL_CACHE:
+        grid = create_meshgrid(h, w, False, device=device).to(dtype)
+        _GRID_GLOBAL_CACHE[key] = grid.permute(0, 3, 1, 2)
+    return _GRID_GLOBAL_CACHE[key]
+
+
 class ConvQuadInterp3d(Module):
     r"""Calculate soft argmax 3d per window.
 
@@ -660,3 +675,10 @@ class ConvQuadInterp3d(Module):
 
     def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
         return conv_quad_interp3d(x, self.strict_maxima_bonus, self.eps)
+
+
+_CENTER_KERNEL_CACHE = {}
+
+_WINDOW_KERNEL_CACHE = {}
+
+_GRID_GLOBAL_CACHE = {}
