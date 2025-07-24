@@ -25,6 +25,8 @@
 #   https://github.com/facebookresearch/dino/blob/master/vision_transformer.py
 #   https://github.com/rwightman/pytorch-image-models/tree/master/timm/layers/patch_embed.py
 
+from __future__ import annotations
+
 from typing import Callable, Optional, Tuple, Union
 
 from torch import Tensor, nn
@@ -34,10 +36,17 @@ from kornia.core.check import KORNIA_CHECK
 
 def make_2tuple(x):
     """Make a tuple of length 2."""
-    if isinstance(x, tuple):
-        KORNIA_CHECK(len(x) == 2)
+    # Fast path: tuple of length 2 (most common use)
+    if type(x) is tuple and len(x) == 2:
         return x
-    KORNIA_CHECK(isinstance(x, int))
+    # Fast path: int
+    if type(x) is int:
+        return (x, x)
+    # Otherwise, do type/length checks (this rarely happens, keep the detailed exception semantics)
+    if isinstance(x, tuple):
+        KORNIA_CHECK(len(x) == 2, "Tuple must have length 2")
+        return x
+    KORNIA_CHECK(isinstance(x, int), "Input must be int or tuple of length 2")
     return (x, x)
 
 
