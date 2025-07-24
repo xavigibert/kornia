@@ -173,7 +173,7 @@ def relative_transformation(trans_01: Tensor, trans_02: Tensor) -> Tensor:
 
 
 def transform_points(trans_01: Tensor, points_1: Tensor) -> Tensor:
-    r"""Apply transformations to a set of points.
+    """Apply transformations to a set of points.
 
     Args:
         trans_01: tensor for transformations of shape
@@ -194,32 +194,33 @@ def transform_points(trans_01: Tensor, points_1: Tensor) -> Tensor:
     """
     KORNIA_CHECK_IS_TENSOR(trans_01)
     KORNIA_CHECK_IS_TENSOR(points_1)
-    if not trans_01.shape[0] == points_1.shape[0] and trans_01.shape[0] != 1:
+    b1 = trans_01.shape[0]
+    b2 = points_1.shape[0]
+    if b1 != b2 and b1 != 1:
         raise ValueError(
             f"Input batch size must be the same for both tensors or 1. Got {trans_01.shape} and {points_1.shape}"
         )
     if not trans_01.shape[-1] == (points_1.shape[-1] + 1):
         raise ValueError(f"Last input dimensions must differ by one unit Got{trans_01} and {points_1}")
 
-    # We reshape to BxNxD in case we get more dimensions, e.g., MxBxNxD
-    shape_inp = list(points_1.shape)
-    points_1 = points_1.reshape(-1, points_1.shape[-2], points_1.shape[-1])
-    trans_01 = trans_01.reshape(-1, trans_01.shape[-2], trans_01.shape[-1])
-    # We expand trans_01 to match the dimensions needed for bmm. repeats input division is cast
-    # to integer so onnx doesn't record the value as a tensor and get a device mismatch
-    trans_01 = torch.repeat_interleave(trans_01, repeats=int(points_1.shape[0] // trans_01.shape[0]), dim=0)
+    # Fast reshape+expand: skip repeated copying
+    orig_shape = points_1.shape
+    points_1_flat = points_1.reshape(-1, points_1.shape[-2], points_1.shape[-1])
+    batch = points_1_flat.shape[0]
+    trans_01_flat = trans_01 if trans_01.shape[0] == batch else trans_01.expand(batch, -1, -1)
+
     # to homogeneous
-    points_1_h = convert_points_to_homogeneous(points_1)  # BxNxD+1
-    # transform coordinates
-    points_0_h = torch.bmm(points_1_h, trans_01.permute(0, 2, 1))
-    points_0_h = torch.squeeze(points_0_h, dim=-1)
+    points_1_h = convert_points_to_homogeneous(points_1_flat)  # BxNxD+1
+
+    # transform coordinates directly; we don't squeeze as bmm's output is already rank 3
+    points_0_h = torch.bmm(points_1_h, trans_01_flat.permute(0, 2, 1))
+
     # to euclidean
     points_0 = convert_points_from_homogeneous(points_0_h)  # BxNxD
-    # reshape to the input shape
-    shape_inp[-2] = points_0.shape[-2]
-    shape_inp[-1] = points_0.shape[-1]
-    points_0 = points_0.reshape(shape_inp)
-    return points_0
+
+    # reshape back to original input's batch dims, keeping output's [-2:], since normalization can change N.
+    out_shape = list(orig_shape[:-2]) + [points_0.shape[-2], points_0.shape[-1]]
+    return points_0.reshape(out_shape)
 
 
 def point_line_distance(point: Tensor, line: Tensor, eps: float = 1e-9) -> Tensor:

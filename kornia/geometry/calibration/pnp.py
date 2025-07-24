@@ -15,12 +15,14 @@
 # limitations under the License.
 #
 
+from __future__ import annotations
+
 from typing import Optional, Tuple
 
 import torch
 from torch.linalg import qr as linalg_qr
 
-from kornia.core import arange, ones_like, where, zeros
+from kornia.core import ones_like, where, zeros
 from kornia.core.check import KORNIA_CHECK, KORNIA_CHECK_IS_TENSOR, KORNIA_CHECK_SAME_SHAPE, KORNIA_CHECK_SHAPE
 from kornia.geometry.conversions import convert_points_to_homogeneous, normalize_points_with_intrinsics
 from kornia.geometry.linalg import transform_points
@@ -29,7 +31,7 @@ from kornia.utils.helpers import _torch_linalg_svdvals, _torch_svd_cast
 
 
 def _mean_isotropic_scale_normalize(points: torch.Tensor, eps: float = 1e-8) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Normalize points.
+    """Normalize points.
 
     Args:
        points : Tensor containing the points to be normalized with shape :math:`(B, N, D)`.
@@ -42,16 +44,23 @@ def _mean_isotropic_scale_normalize(points: torch.Tensor, eps: float = 1e-8) -> 
     """
     KORNIA_CHECK_SHAPE(points, ["B", "N", "D"])
     x_mean = torch.mean(points, dim=1, keepdim=True)  # Bx1xD
-    scale = (points - x_mean).norm(dim=-1, p=2).mean(dim=-1)  # B
+
+    # Use keepdim for scale calculation to reduce temp allocations
+    scale = (points - x_mean).norm(dim=-1, p=2)
+    scale = scale.mean(dim=1)  # B
 
     D_int = points.shape[-1]
-    D_float = torch.tensor(points.shape[-1], dtype=torch.float64, device=points.device)
-    scale = torch.sqrt(D_float) / (scale + eps)  # B
-    transform = eye_like(D_int + 1, points)  # (B, D+1, D+1)
+    D_float = float(D_int)
+    scale = torch.sqrt(torch.tensor(D_float, dtype=points.dtype, device=points.device)) / (scale + eps)  # B
 
-    idxs = arange(D_int, dtype=torch.int64, device=points.device)
-    transform[:, idxs, idxs] = transform[:, idxs, idxs] * scale[:, None]
-    transform[:, idxs, D_int] = transform[:, idxs, D_int] + (-scale[:, None] * x_mean[:, 0, idxs])
+    B = points.shape[0]
+    # Create the transformation matrix efficiently (reuse created identity and use broadcasting)
+    transform = torch.eye(D_int + 1, dtype=points.dtype, device=points.device).expand(B, D_int + 1, D_int + 1).clone()
+    idxs = torch.arange(D_int, dtype=torch.long, device=points.device)
+    # Transform diagonals with broadcasting
+    transform[:, idxs, idxs] = scale[:, None]
+    # Transform translation
+    transform[:, idxs, D_int] = -scale[:, None] * x_mean[:, 0, idxs]
 
     points_norm = transform_points(transform, points)  # BxNxD
 
