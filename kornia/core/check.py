@@ -70,6 +70,21 @@ def KORNIA_CHECK_SHAPE(x: Tensor, shape: list[str], raises: bool = True) -> bool
         True
 
     """
+    # Fast path for all-str shape with no "*" and all dims numeric
+    if "*" not in shape:
+        if len(x.shape) != len(shape):
+            if raises:
+                raise TypeError(f"{x} shape must be [{shape}]. Got {x.shape}")
+            return False
+        for i, dim_ in enumerate(shape):
+            if dim_.isnumeric():
+                if x.shape[i] != int(dim_):
+                    if raises:
+                        raise TypeError(f"{x} shape must be [{shape}]. Got {x.shape}")
+                    return False
+        return True
+
+    # General case: handle "*" at beginning or end; keep logic same as original for compatibility.
     if "*" == shape[0]:
         shape_to_check = shape[1:]
         x_shape_to_check = x.shape[-len(shape) + 1 :]
@@ -83,20 +98,14 @@ def KORNIA_CHECK_SHAPE(x: Tensor, shape: list[str], raises: bool = True) -> bool
     if len(x_shape_to_check) != len(shape_to_check):
         if raises:
             raise TypeError(f"{x} shape must be [{shape}]. Got {x.shape}")
-        else:
-            return False
+        return False
 
     for i in range(len(x_shape_to_check)):
-        # The voodoo below is because torchscript does not like
-        # that dim can be both int and str
         dim_: str = shape_to_check[i]
-        if not dim_.isnumeric():
-            continue
-        dim = int(dim_)
-        if x_shape_to_check[i] != dim:
-            if raises:
-                raise TypeError(f"{x} shape must be [{shape}]. Got {x.shape}")
-            else:
+        if dim_.isnumeric():
+            if x_shape_to_check[i] != int(dim_):
+                if raises:
+                    raise TypeError(f"{x} shape must be [{shape}]. Got {x.shape}")
                 return False
     return True
 
