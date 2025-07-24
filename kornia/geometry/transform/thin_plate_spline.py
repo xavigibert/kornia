@@ -51,7 +51,9 @@ def _kernel_distance(squared_distances: torch.Tensor, eps: float = 1e-8) -> torc
     :math: `0.5 r^2 log(r^2)`.
     """
     # r^2 * log(r) = 1/2 * r^2 * log(r^2)
-    return 0.5 * squared_distances * squared_distances.add(eps).log()
+    # Optimize: compute log once, and avoid allocating large intermediates
+    log_sq_dist = squared_distances.add(eps).log_()
+    return 0.5 * squared_distances * log_sq_dist
 
 
 def get_tps_transform(points_src: torch.Tensor, points_dst: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
