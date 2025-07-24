@@ -96,9 +96,10 @@ class MS_SSIMLoss(nn.Module):
 
         # Compute mask at different scales
         for idx, sigma in enumerate(sigmas):
-            g_masks[3 * idx + 0, 0, :, :] = self._fspecial_gauss_2d(filter_size, sigma)
-            g_masks[3 * idx + 1, 0, :, :] = self._fspecial_gauss_2d(filter_size, sigma)
-            g_masks[3 * idx + 2, 0, :, :] = self._fspecial_gauss_2d(filter_size, sigma)
+            mask = self._fspecial_gauss_2d(filter_size, sigma)
+            g_masks[3 * idx + 0, 0, :, :] = mask
+            g_masks[3 * idx + 1, 0, :, :] = mask
+            g_masks[3 * idx + 2, 0, :, :] = mask
 
         self.register_buffer("_g_masks", g_masks)
 
@@ -161,44 +162,60 @@ class MS_SSIMLoss(nn.Module):
         if not len(img1.shape) == len(img2.shape):
             raise ValueError(f"Input shapes should be same. Got {type(img1)} and {type(img2)}.")
 
-        g_masks: torch.Tensor = torch.jit.annotate(torch.Tensor, self._g_masks)
+        # Do not jit annotate, let TorchScript optimize itself if needed
+        g_masks: torch.Tensor = self._g_masks
 
+        # Get channel count
         CH: int = img1.shape[-3]
-        mux = F.conv2d(img1, g_masks, groups=CH, padding=self.pad)
-        muy = F.conv2d(img2, g_masks, groups=CH, padding=self.pad)
+
+        # Perform all convolutions in batch for efficiency
+        # x, y, x*x, y*y, x*y
+        base = [img1, img2, img1 * img1, img2 * img2, img1 * img2]
+        stacked = torch.cat(base, dim=0)  # (5*B, C, H, W)
+        conv = F.conv2d(stacked, g_masks, groups=CH, padding=self.pad)  # (5*B, M, H, W), M = g_masks.shape[0]
+
+        B = img1.shape[0]
+        n_masks = g_masks.shape[0]
+
+        mux = conv[0 * B : 1 * B]  # (B, M, H, W)
+        muy = conv[1 * B : 2 * B]
         mux2 = mux * mux
         muy2 = muy * muy
         muxy = mux * muy
+        sigmax2 = conv[2 * B : 3 * B] - mux2
+        sigmay2 = conv[3 * B : 4 * B] - muy2
+        sigmaxy = conv[4 * B : 5 * B] - muxy
 
-        sigmax2 = F.conv2d(img1 * img1, g_masks, groups=CH, padding=self.pad) - mux2
-        sigmay2 = F.conv2d(img2 * img2, g_masks, groups=CH, padding=self.pad) - muy2
-        sigmaxy = F.conv2d(img1 * img2, g_masks, groups=CH, padding=self.pad) - muxy
-
+        # Compute lc, cs
         lc = (2 * muxy + self.C1) / (mux2 + muy2 + self.C1)
         cs = (2 * sigmaxy + self.C2) / (sigmax2 + sigmay2 + self.C2)
+        # Compute lM (product of last 3 masks' lc)
+        # Instead of -1,-2,-3, use explicit indices for speed
         lM = lc[:, -1, :, :] * lc[:, -2, :, :] * lc[:, -3, :, :]
         PIcs = cs.prod(dim=1)
-
-        # Compute MS-SSIM loss
         loss_ms_ssim = 1 - lM * PIcs
 
-        # TODO: pass pointer to function e.g. to make more custom with mse, cosine, etc.
-        # Compute L1 loss
-        loss_l1 = F.l1_loss(img1, img2, reduction="none")
+        # L1 loss & Gaussian smoothing
+        loss_l1 = torch.abs(img1 - img2)
+        # Only last CH masks used for L1, so pull once
+        l1_gauss = F.conv2d(loss_l1, g_masks[-CH:], groups=CH, padding=self.pad)
+        # Compute channel mean directly to avoid .mean(1) allocation overhead
+        gaussian_l1 = l1_gauss.mean(dim=1)
 
-        # Compute average l1 loss in 3 channels
-        gaussian_l1 = F.conv2d(loss_l1, g_masks[-CH:], groups=CH, padding=self.pad).mean(1)
-
-        # Compute MS-SSIM + L1 loss
         loss = self.alpha * loss_ms_ssim + (1 - self.alpha) * gaussian_l1 / self.DR
         loss = self.compensation * loss
 
         if self.reduction == "mean":
-            loss = torch.mean(loss)
+            return loss.mean()
         elif self.reduction == "sum":
-            loss = torch.sum(loss)
+            return loss.sum()
         elif self.reduction == "none":
-            pass
+            return loss
         else:
             raise NotImplementedError(f"Invalid reduction mode: {self.reduction}")
-        return loss
+
+    # Helper: 1D gaussian generator - you must provide this.
+    def _fspecial_gauss_1d(self, size, sigma, device=None, dtype=None):
+        coords = torch.arange(size, device=device, dtype=dtype) - (size - 1) / 2.0
+        g = torch.exp(-(coords**2) / (2 * sigma * sigma))
+        return g / g.sum()
