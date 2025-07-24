@@ -155,21 +155,49 @@ class VonMisesKernel(nn.Module):
         self.register_buffer("weights", weights)
 
     def forward(self, x: Tensor) -> Tensor:
+        # Input checks (kept as is, negligible overhead)
         if not isinstance(x, Tensor):
             raise TypeError(f"Input type is not a Tensor. Got {type(x)}")
-
         if not len(x.shape) == 4 or x.shape[1] != 1:
             raise ValueError(f"Invalid input shape, we expect Bx1xHxW. Got: {x.shape}")
-
         if not isinstance(self.emb0, Tensor):
             raise TypeError(f"Emb0 type is not a Tensor. Got {type(x)}")
 
-        emb0 = self.emb0.to(x).repeat(x.size(0), 1, 1, 1)
-        frange = self.frange.to(x) * x
-        emb1 = cos(frange)
-        emb2 = sin(frange)
-        embedding = torch.cat([emb0, emb1, emb2], dim=1)
-        embedding = self.weights * embedding
+        B, _, H, W = x.shape
+        device = x.device
+        dtype = x.dtype
+
+        # move buffers to device/dtype once per call
+        # --- Fast broadcast for emb0 ---
+        # Instead of .to(x).repeat(B, 1, 1, 1), expand from (1,1,H,W) to (B,1,H,W)
+        emb0 = self.emb0
+        if emb0.device != device or emb0.dtype != dtype:
+            emb0 = emb0.to(device=device, dtype=dtype)
+        emb0 = emb0.expand(B, -1, H, W)
+
+        # --- frange-based embedding: instead of frange.to(x)*x, use broadcasting arithmetic ---
+        frange = self.frange
+        if frange.device != device or frange.dtype != dtype:
+            frange = frange.to(device=device, dtype=dtype)
+        # x : (B,1,H,W), frange: (n,1,1)
+        # want output: (B, n, H, W)
+        frange_x = frange * x  # broadcast multiply
+
+        # --- cosine and sine parts ---
+        emb1 = cos(frange_x)  # (B, n, H, W)
+        emb2 = sin(frange_x)  # (B, n, H, W)
+
+        # Concatenate all outputs in one pass (avoiding python list-of-tensors usage)
+        # emb0: (B,1,H,W), emb1: (B,n,H,W), emb2: (B,n,H,W) -> (B, 1 + 2n, H, W)
+        embedding = torch.cat((emb0, emb1, emb2), dim=1)
+
+        # --- Efficient weighting ---
+        weights = self.weights
+        if weights.device != device or weights.dtype != dtype:
+            weights = weights.to(device=device, dtype=dtype)
+        # weights: (2n+1,1,1), embedding: (B,2n+1,H,W) => broadcast multiply
+        embedding = embedding * weights
+
         return embedding
 
     def __repr__(self) -> str:
