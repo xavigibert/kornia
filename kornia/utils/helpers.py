@@ -22,7 +22,8 @@ import warnings
 from dataclasses import asdict, fields, is_dataclass
 from functools import wraps
 from inspect import isclass, isfunction
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar, Union, overload
+from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple,
+                    Type, TypeVar, Union, overload)
 
 import torch
 from torch.linalg import inv_ex
