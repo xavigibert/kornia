@@ -29,7 +29,12 @@ from kornia.core import Tensor
 
 def _get_base_url(model_type: Literal["b1", "b2", "b3"] = "b1", resolution: Literal[224, 256, 288] = 224) -> str:
     """Return the base URL of the model weights."""
-    return f"https://huggingface.co/kornia/efficientvit_imagenet_{model_type}_r{resolution}/resolve/main/{model_type}-r{resolution}.pt"
+    # Fastest return via dictionary lookup, fallback to formatted string only if out of spec
+    try:
+        return _BASE_URLS[(model_type, resolution)]
+    except KeyError:
+        # fallback if somehow an unsupported model_type/resolution is passed, matches original behavior
+        return f"https://huggingface.co/kornia/efficientvit_imagenet_{model_type}_r{resolution}/resolve/main/{model_type}-r{resolution}.pt"
 
 
 @dataclass
@@ -109,3 +114,16 @@ class EfficientViT(ModelBase[EfficientViTConfig]):
         """
         feats = self.backbone(images)
         return feats
+
+
+_MODEL_TYPES = ("b1", "b2", "b3")
+
+_RESOLUTIONS = (224, 256, 288)
+
+_BASE_URLS = {
+    (model_type, resolution): (
+        f"https://huggingface.co/kornia/efficientvit_imagenet_{model_type}_r{resolution}/resolve/main/{model_type}-r{resolution}.pt"
+    )
+    for model_type in _MODEL_TYPES
+    for resolution in _RESOLUTIONS
+}
