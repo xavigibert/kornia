@@ -46,17 +46,20 @@ class CachedDownloader:
             str: The full local path where the model should be stored or loaded from.
 
         """
-        # Determine the local file path
         if cache_dir is None:
             cache_dir = kornia_config.hub_cache_dir
 
-        # The filename is the model name (without directory path)
-        if suffix is not None and not model_name.endswith(suffix):
-            file_name = f"{os.path.split(model_name)[-1]}{suffix}"
+        # Extract directory and filename efficiently
+        model_parts = model_name.split(os.sep)
+        filename = model_parts[-1]
+        if suffix is not None and not filename.endswith(suffix):
+            filename = f"{filename}{suffix}"
+
+        if len(model_parts) > 1:
+            path = os.path.join(cache_dir, *model_parts[:-1], filename)
         else:
-            file_name = os.path.split(model_name)[-1]
-        file_path = os.path.join(*cache_dir.split(os.sep), *model_name.split(os.sep)[:-1], file_name)
-        return file_path
+            path = os.path.join(cache_dir, filename)
+        return path
 
     @classmethod
     def download_to_cache(cls, url: str, name: str, download: bool = True, **kwargs: Any) -> str:
