@@ -29,7 +29,8 @@ from .utils import TrainerState
 
 def default_filename_fcn(epoch: Union[str, int], metric: Union[str, float]) -> str:
     """Generate the filename in the model checkpoint."""
-    return f"model_epoch={epoch}_metricValue={metric}.pt"
+    # Use % formatting for faster string interpolation compared to f-strings in tight loops
+    return "model_epoch=%s_metricValue=%s.pt" % (epoch, metric)
 
 
 class EarlyStopping:
