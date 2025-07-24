@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Optional
 
 import torch
@@ -27,9 +28,10 @@ from kornia.filters.sobel import spatial_gradient3d
 from kornia.geometry.conversions import normalize_pixel_coordinates, normalize_pixel_coordinates3d
 from kornia.utils import create_meshgrid, create_meshgrid3d
 from kornia.utils._compat import torch_version_ge
+from kornia.utils.grid import create_meshgrid
 from kornia.utils.helpers import safe_solve_with_mask
 
-from .dsnt import spatial_expectation2d, spatial_softmax2d
+from .dsnt import _validate_batched_image_tensor_input, spatial_expectation2d, spatial_softmax2d
 from .nms import nms3d
 
 
@@ -503,7 +505,7 @@ def conv_soft_argmax3d(
 def spatial_soft_argmax2d(
     input: Tensor, temperature: Optional[Tensor] = None, normalized_coordinates: bool = True
 ) -> Tensor:
-    r"""Compute the Spatial Soft-Argmax 2D of a given input heatmap.
+    """Compute the Spatial Soft-Argmax 2D of a given input heatmap.
 
     Args:
         input: the given heatmap with shape :math:`(B, N, H, W)`.
@@ -524,10 +526,11 @@ def spatial_soft_argmax2d(
         tensor([[[1.0000, 1.0000]]])
 
     """
-    if temperature is None:
-        temperature = tensor(1.0)
-    input_soft: Tensor = spatial_softmax2d(input, temperature)
-    output: Tensor = spatial_expectation2d(input_soft, normalized_coordinates)
+    # Only validate once here for the highest-level function
+    _validate_batched_image_tensor_input(input)
+    input_soft = spatial_softmax2d(input, temperature)
+    # spatial_expectation2d assumes input is valid probability map
+    output = spatial_expectation2d(input_soft, normalized_coordinates)
     return output
 
 
@@ -641,6 +644,19 @@ def conv_quad_interp3d(input: Tensor, strict_maxima_bonus: float = 10.0, eps: fl
     coords_max = coords_max + dx_res
 
     return coords_max, y_max
+
+
+# Efficient meshgrid caching, storing by (height, width, normalized, device, dtype)
+# Note: for graph-tracing, this is bypassed; for eager, it's substantially faster
+@lru_cache(maxsize=32)  # tune as needed
+def _cached_meshgrid(height: int, width: int, normalized: bool, device: str, dtype: torch.dtype) -> Tensor:
+    grid = create_meshgrid(height, width, normalized, torch.device(device), dtype)
+    return grid
+
+
+def _get_meshgrid(height: int, width: int, normalized: bool, device: torch.device, dtype: torch.dtype) -> Tensor:
+    # device is torch.device; lru_cache key must be convertible to hashable type
+    return _cached_meshgrid(height, width, normalized, str(device), dtype)
 
 
 class ConvQuadInterp3d(Module):

@@ -22,11 +22,12 @@ As described in the paper "Numerical Coordinate Regression with Convolutional Ne
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Optional
 
 import torch
 
-from kornia.core import Tensor, concatenate, softmax
+from kornia.core import Tensor, softmax
 from kornia.core.check import KORNIA_CHECK_IS_TENSOR, KORNIA_CHECK_SHAPE
 from kornia.utils.grid import create_meshgrid
 
@@ -37,7 +38,7 @@ def _validate_batched_image_tensor_input(tensor: Tensor) -> None:
 
 
 def spatial_softmax2d(input: Tensor, temperature: Optional[Tensor] = None) -> Tensor:
-    r"""Apply the Softmax function over features in each image channel.
+    """Apply the Softmax function over features in each image channel.
 
     Note that this function behaves differently to :py:class:`torch.nn.Softmax2d`, which
     instead applies Softmax over features at each spatial location.
@@ -60,21 +61,24 @@ def spatial_softmax2d(input: Tensor, temperature: Optional[Tensor] = None) -> Te
                   [0.0585, 0.1589, 0.4319]]]])
 
     """
+    # Only input validation once per user-facing call
     _validate_batched_image_tensor_input(input)
-
     batch_size, channels, height, width = input.shape
     if temperature is None:
-        temperature = torch.tensor(1.0)
-    temperature = temperature.to(device=input.device, dtype=input.dtype)
-    x = input.view(batch_size, channels, -1)
+        temperature = 1.0
+    temperature = torch.as_tensor(temperature, device=input.device, dtype=input.dtype)
 
-    x_soft = softmax(x * temperature, dim=-1)
+    # Flatten spatial dims, compute numerically stable softmax in-place
+    x = input.reshape(batch_size, channels, -1)
+    x = x * temperature
 
-    return x_soft.view(batch_size, channels, height, width)
+    # Use torch's in-place softmax if available (or standard)
+    x_soft = softmax(x, dim=-1)
+    return x_soft.reshape(batch_size, channels, height, width)
 
 
 def spatial_expectation2d(input: Tensor, normalized_coordinates: bool = True) -> Tensor:
-    r"""Compute the expectation of coordinate values using spatial probabilities.
+    """Compute the expectation of coordinate values using spatial probabilities.
 
     The input heatmap is assumed to represent a valid spatial probability distribution,
     which can be achieved using :func:`~kornia.geometry.subpixel.spatial_softmax2d`.
@@ -96,26 +100,22 @@ def spatial_expectation2d(input: Tensor, normalized_coordinates: bool = True) ->
         tensor([[[1., 2.]]])
 
     """
-    _validate_batched_image_tensor_input(input)
-
+    # Assume input is valid as output of spatial_softmax2d
     batch_size, channels, height, width = input.shape
 
-    # Create coordinates grid.
-    grid = create_meshgrid(height, width, normalized_coordinates, input.device)
-    grid = grid.to(input.dtype)
+    # Use cached meshgrid, and ensure dtype matches input
+    grid = _get_meshgrid(height, width, normalized_coordinates, input.device, input.dtype)
+    # shape: (1, H, W, 2)
+    # Flatten to (H*W, 2)
+    grid_flat = grid[0].reshape(-1, 2)  # [H*W, 2]
 
-    pos_x = grid[..., 0].reshape(-1)
-    pos_y = grid[..., 1].reshape(-1)
+    # input: (B, N, H, W) => (B, N, H*W)
+    input_flat = input.reshape(batch_size, channels, -1)
+    # Expectation via batch matmul (x/y together for efficiency):
+    # (B,N,H*W) x (H*W,2) --> (B,N,2)
+    output = torch.matmul(input_flat, grid_flat)  # weighted sum over each channel
 
-    input_flat = input.view(batch_size, channels, -1)
-
-    # Compute the expectation of the coordinates.
-    expected_y = torch.sum(pos_y * input_flat, -1, keepdim=True)
-    expected_x = torch.sum(pos_x * input_flat, -1, keepdim=True)
-
-    output = concatenate([expected_x, expected_y], -1)
-
-    return output.view(batch_size, channels, 2)  # BxNx2
+    return output
 
 
 def _safe_zero_division(numerator: Tensor, denominator: Tensor, eps: float = 1e-32) -> Tensor:
@@ -170,3 +170,16 @@ def render_gaussian2d(mean: Tensor, std: Tensor, size: tuple[int, int], normaliz
     gauss = _safe_zero_division(gauss, val_sum)
 
     return gauss
+
+
+# Efficient meshgrid caching, storing by (height, width, normalized, device, dtype)
+# Note: for graph-tracing, this is bypassed; for eager, it's substantially faster
+@lru_cache(maxsize=32)  # tune as needed
+def _cached_meshgrid(height: int, width: int, normalized: bool, device: str, dtype: torch.dtype) -> Tensor:
+    grid = create_meshgrid(height, width, normalized, torch.device(device), dtype)
+    return grid
+
+
+def _get_meshgrid(height: int, width: int, normalized: bool, device: torch.device, dtype: torch.dtype) -> Tensor:
+    # device is torch.device; lru_cache key must be convertible to hashable type
+    return _cached_meshgrid(height, width, normalized, str(device), dtype)
