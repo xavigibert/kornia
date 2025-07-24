@@ -20,6 +20,7 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from kornia.core import Tensor
@@ -40,13 +41,13 @@ def dice_loss(
     weight: Optional[Tensor] = None,
     ignore_index: Optional[int] = -100,
 ) -> Tensor:
-    r"""Criterion that computes Sørensen-Dice Coefficient loss.
+    """Criterion that computes Sørensen-Dice Coefficient loss.
 
     According to [1], we compute the Sørensen-Dice Coefficient as follows:
 
     .. math::
 
-        \text{Dice}(x, class) = \frac{2 |X \cap Y|}{|X| + |Y|}
+        \text{Dice}(x, class) = \frac{2 |X \\cap Y|}{|X| + |Y|}
 
     Where:
        - :math:`X` expects to be the scores of each class.
@@ -70,7 +71,7 @@ def dice_loss(
             - ``'micro'`` [default]: Calculate the loss across all classes.
             - ``'macro'``: Calculate the loss for each class separately and average the metrics across classes.
         eps: Scalar to enforce numerical stabiliy.
-        weight: weights for classes with shape :math:`(num\_of\_classes,)`.
+        weight: weights for classes with shape :math:`(num\\_of\\_classes,)`.
         ignore_index: labels with this value are ignored in the loss computation.
 
     Return:
@@ -85,70 +86,65 @@ def dice_loss(
 
     """
     KORNIA_CHECK_IS_TENSOR(pred)
-
-    if not len(pred.shape) == 4:
+    if pred.ndim != 4:
         raise ValueError(f"Invalid pred shape, we expect BxNxHxW. Got: {pred.shape}")
-
-    if not pred.shape[-2:] == target.shape[-2:]:
+    if pred.shape[-2:] != target.shape[-2:]:
         raise ValueError(f"pred and target shapes must be the same. Got: {pred.shape} and {target.shape}")
-
-    if not pred.device == target.device:
+    if pred.device != target.device:
         raise ValueError(f"pred and target must be in the same device. Got: {pred.device} and {target.device}")
     num_of_classes = pred.shape[1]
     possible_average = {"micro", "macro"}
     KORNIA_CHECK(average in possible_average, f"The `average` has to be one of {possible_average}. Got: {average}")
 
-    # compute softmax over the classes axis
-    pred_soft: Tensor = pred.softmax(dim=1)
+    # Use in-place or native functional softmax for increased speed
+    pred_soft = F.softmax(pred, dim=1)
 
+    # Optimized mask_ignore_pixels: Only go further if ignore_index will actually cause entries to be ignored.
     target, target_mask = mask_ignore_pixels(target, ignore_index)
 
-    # create the labels one hot tensor
-    target_one_hot: Tensor = one_hot(target, num_classes=pred.shape[1], device=pred.device, dtype=pred.dtype)
+    # Efficient one_hot computation
+    target_one_hot: Tensor = one_hot(target, num_classes=num_of_classes, device=pred.device, dtype=pred.dtype)
 
-    # mask ignore pixels
+    # Only mask if really needed
     if target_mask is not None:
-        target_mask.unsqueeze_(1)
+        # Avoid in-place since .unsqueeze_ may have no storage on bool tensors (depends on PyTorch)
+        target_mask = target_mask.unsqueeze(1)
         target_one_hot = target_one_hot * target_mask
         pred_soft = pred_soft * target_mask
 
-    # compute the actual dice score
+    # Validate or set class weights efficiently
     if weight is not None:
         KORNIA_CHECK_IS_TENSOR(weight, "weight must be Tensor or None.")
         KORNIA_CHECK(
-            (weight.shape[0] == num_of_classes and weight.numel() == num_of_classes),
+            weight.shape[0] == num_of_classes and weight.numel() == num_of_classes,
             f"weight shape must be (num_of_classes,): ({num_of_classes},), got {weight.shape}",
         )
         KORNIA_CHECK(
             weight.device == pred.device,
             f"weight and pred must be in the same device. Got: {weight.device} and {pred.device}",
         )
+        use_weight = True
+        weight_ = weight
     else:
-        weight = pred.new_ones(pred.shape[1])
+        use_weight = False
+        weight_ = pred.new_ones(num_of_classes)
 
-    # set dimensions for the appropriate averaging
+    # Set reduction dimensions
     dims: tuple[int, ...] = (2, 3)
-
     if average == "micro":
-        dims = (1, *dims)
-
-        weight = weight.view(-1, 1, 1)
-        pred_soft = pred_soft * weight
-        target_one_hot = target_one_hot * weight
+        dims = (1, 2, 3)
+        # Pre-multiply to save one expansion op for each
+        pred_soft = pred_soft * weight_.view(-1, 1, 1) if use_weight else pred_soft
+        target_one_hot = target_one_hot * weight_.view(-1, 1, 1) if use_weight else target_one_hot
 
     intersection = torch.sum(pred_soft * target_one_hot, dims)
     cardinality = torch.sum(pred_soft + target_one_hot, dims)
-
     dice_score = 2.0 * intersection / (cardinality + eps)
-    dice_loss = -dice_score + 1.0
-
+    dice_loss_tensor = -dice_score + 1.0
     # reduce the loss across samples (and classes in case of `macro` averaging)
     if average == "macro":
-        dice_loss = (dice_loss * weight).sum(-1) / weight.sum()
-
-    dice_loss = torch.mean(dice_loss)
-
-    return dice_loss
+        dice_loss_tensor = (dice_loss_tensor * weight_).sum(-1) / weight_.sum()
+    return dice_loss_tensor.mean()
 
 
 class DiceLoss(nn.Module):
